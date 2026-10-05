@@ -1,0 +1,102 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment variables. Never commit real keys.
+.env
+.env.local
+.env.docker
+*.pem
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Vector database
+chroma_db/
+faiss_index/
+
+# Cache
+.easyocr_cache/
+.cache/
+*.cache
+data/_documents_cache.pkl
+data/_documents_cache.pkl.meta.json
+data/_parent_documents_cache.pkl
+data/_parent_documents_cache.pkl.meta.json
+
+# Logs
+*.log
+logs/
+
+# Data files (keep structure, ignore content)
+data/*.pdf
+data/*.json
+data/*.db
+data/*.sqlite
+data/agent_traces/
+data/lora/
+data/preferences/
+!data/.gitkeep
+
+# Models (download locally)
+models/
+bge-m3/
+data/lora/adapter/
+
+# Game art and UI cuts stay on the local machine.
+photo/*
+!photo/.gitkeep
+web/public/ui/*.png
+
+# Frontend and docs dependencies
+web/node_modules/
+docs/node_modules/
+*.pth
+*.bin
+*.safetensors
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+
+# Test outputs
+test_results/
+eval_results/
