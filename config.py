@@ -19,6 +19,14 @@ PERSIST_DIRECTORY = os.getenv("PERSIST_DIRECTORY", "chroma_db").strip()
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "zhipu").strip().lower()
 LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "60"))
 LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "3"))
+# 配队选人提示词已经压短。超时后程序按标签补 6 人，因此只等一轮、不再重试。
+TEAM_LLM_TIMEOUT = int(os.getenv("TEAM_LLM_TIMEOUT", "45"))
+TEAM_LLM_MAX_RETRIES = int(os.getenv("TEAM_LLM_MAX_RETRIES", "1"))
+TEAM_USE_VECTOR = os.getenv("TEAM_USE_VECTOR", "false").strip().lower() in {"1", "true", "yes"}
+USE_LORA_REPLIER = os.getenv("USE_LORA_REPLIER", "false").strip().lower() in {"1", "true", "yes", "on"}
+WEB_SEARCH_API_KEY = os.getenv("WEB_SEARCH_API_KEY", "").strip()
+WEB_SEARCH_ENGINE = os.getenv("WEB_SEARCH_ENGINE", "tavily").strip().lower() or "tavily"
+WEB_SEARCH_ENDPOINT = os.getenv("WEB_SEARCH_ENDPOINT", "").strip()
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:16379/0").strip()
 SESSION_TTL = int(os.getenv("SESSION_TTL", "3600"))
 

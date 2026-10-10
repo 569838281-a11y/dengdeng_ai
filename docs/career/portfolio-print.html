@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>灯灯 · 作品集</title>
+<style>
+  @page { size: A4; margin: 16mm 16mm 18mm; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+    color: #1c3b2e;
+    font-size: 11.5pt;
+    line-height: 1.55;
+  }
+  h1 { font-size: 26pt; line-height: 1.25; margin: 0 0 8px; }
+  h2 { font-size: 15pt; margin: 0 0 8px; color: #1f7a45; page-break-after: avoid; }
+  h3 { font-size: 12.5pt; margin: 12px 0 4px; page-break-after: avoid; }
+  p { margin: 0 0 8px; }
+  a { color: #1f7a45; text-decoration: none; }
+  code { font-family: Consolas, monospace; font-size: 10pt; background: #f3f8f4; padding: 0 3px; }
+  .kicker { letter-spacing: 0.12em; font-size: 10pt; color: #2f9b64; font-weight: 700; }
+  .lead { font-size: 13pt; }
+  .note { font-size: 9.5pt; color: #5d6b62; }
+  .cover { page-break-after: always; min-height: 250mm; }
+  .band { height: 8px; background: #7bc67e; margin: 0 0 18px; }
+  .cards { display: flex; gap: 8px; margin: 12px 0 8px; }
+  .card {
+    flex: 1; border: 1.5px dashed #2f9b64; border-radius: 10px;
+    min-height: 78px; padding: 8px; background: #f7fcf4; font-size: 9.5pt;
+  }
+  .card strong { display: block; margin-bottom: 4px; }
+  .flow { display: flex; gap: 6px; align-items: stretch; margin: 8px 0 10px; }
+  .node {
+    flex: 1; background: #fff8e7; border: 2px solid #c9a36a; border-radius: 10px;
+    padding: 8px; font-size: 9.5pt; text-align: center;
+  }
+  .node b { display: block; color: #1f7a45; }
+  ul, ol { margin: 4px 0 8px; padding-left: 1.2em; }
+  li { margin: 2px 0; }
+  table { width: 100%; border-collapse: collapse; font-size: 10pt; margin: 6px 0 10px; }
+  th, td { border: 1px solid #d7e6d4; padding: 4px 6px; text-align: left; }
+  th { background: #e8f6e4; }
+  .slice { page-break-inside: avoid; margin-bottom: 10px; }
+  .label { font-weight: 700; }
+  footer { margin-top: 12px; font-size: 9pt; color: #5d6b62; }
+</style>
+</head>
+<body>
+<section class="cover">
+  <div class="band"></div>
+  <p class="kicker">AI 应用作品集 · 个人项目</p>
+  <h1>灯灯<br>一个会拒绝瞎编的对战助手</h1>
+  <p class="lead">程序先查出名单、技能和伤害。模型只负责用固定角色把这些话说出来。说漏了事实，这句话就作废。</p>
+  <p class="note">非官方粉丝向原型。洛克王国的名称与素材版权归原权利人。公开仓库不含立绘、界面切图和密钥。</p>
+  <div class="cards">
+    <div class="card"><strong>配队</strong>待补截图：6 人卡片。名单来自程序，气泡只是口吻。</div>
+    <div class="card"><strong>检索</strong>待补截图：步骤条与灯灯回答。查不到就不编图鉴。</div>
+    <div class="card"><strong>对战</strong>待补截图：一键配招后开战。结算不等待大模型。</div>
+  </div>
+  <p>源码 <a href="https://github.com/569838281-a11y/dengdeng_ai">github.com/569838281-a11y/dengdeng_ai</a></p>
+  <p>本地演示 http://127.0.0.1:5173</p>
+</section>
+
+<section>
+  <h2>我做的事</h2>
+  <p>一个人把四段接上：知识放进 JSON，接口用 FastAPI 算完，React 19 页面把结果画出来，口吻模型只在最后说话。角色是双灯鱼「灯灯」。她不选人，不算伤害，也不背图鉴。</p>
+  <h2>约束</h2>
+  <ul>
+    <li>种族值、技能效果、六人名单必须来自仓库资料。</li>
+    <li>云端模型和本地 1.5B 都可能很慢。对战按钮不能等它们。</li>
+    <li>训练按 8GB 显存设计，只训小适配器，不训 7B。</li>
+    <li>没有授权的游戏图不放进公开仓库，也不放进这份 PDF。</li>
+  </ul>
+  <h2>怎么接在一起</h2>
+  <div class="flow">
+    <div class="node"><b>页面</b>React 19<br>5173</div>
+    <div class="node"><b>接口</b>FastAPI<br>8000</div>
+    <div class="node"><b>知识</b>32 只 JSON<br>规则表</div>
+    <div class="node"><b>对战</b>公式结算<br>模板解说</div>
+    <div class="node"><b>口吻</b>LoRA → 教师<br>→ 模板</div>
+  </div>
+  <p>配队进入 <code>pokemon_kb</code>，检索进入 <code>knowledge_search</code>，对战进入 <code>battle.py</code>。需要口语时才调用 <code>dengdeng_reply</code>。政策 PDF 的混合检索仍在仓库里，入口是 <code>POST /api/v1/query</code>，打开产品页面不会走到它。</p>
+</section>
+
+<section>
+  <h2>三个切片</h2>
+  <div class="slice">
+    <h3>1. 先查表，再考虑向量</h3>
+    <p><span class="label">背景。</span>问属性和技能效果时，答案在 JSON 和规则表里。</p>
+    <p><span class="label">做法。</span><code>plan_query</code> 用规则判定意图。对得上名字、技能或属性，就不调用模型。<code>lookup_by_plan</code> 拼出事实。向量索引加载失败就跳过。本地和网页都没有时，<code>pick_cry</code> 说明知识不够。</p>
+    <p><span class="label">权衡。</span>问法很绕时，才让云端只输出意图 JSON。后面仍有事实校验。</p>
+    <p class="note">文件：knowledge_search.py、pokemon_kb.py、knowledge/pokemon/*.json、knowledge/rules.md</p>
+  </div>
+  <div class="slice">
+    <h3>2. 程序点名，灯灯只改说法</h3>
+    <p><span class="label">背景。</span>队伍必须是 6 只，每只 4 个技能、一种血脉、全队一个道具。</p>
+    <p><span class="label">做法。</span><code>propose_team_line</code> 选人，<code>complete_team_answer</code> 补技能、血脉和道具，<code>validate_team_answer</code> 核对。通过后才让灯灯改说法。卡片用程序名单。</p>
+    <p><span class="label">权衡。</span>规则覆盖不了所有口语偏好。换来的是名单可核对。模型说丢名字，这次口吻作废，模板仍能念出 6 人。</p>
+    <p class="note">文件：agents/pipeline.py、pokemon_kb.py、agents/dengdeng_reply.py、TeamCards.jsx</p>
+  </div>
+  <div class="slice">
+    <h3>3. 口吻可以训，结算不能等</h3>
+    <p><span class="label">背景。</span>希望回答像灯灯。点开战或技能时不能等模型冷启动。</p>
+    <p><span class="label">做法。</span>教师只改写程序已经写好的事实。<code>_mask_labels</code> 把提示词标成 -100，损失只落在助手回答。基座 Qwen2.5-1.5B，PEFT 只改 q_proj 与 v_proj，r=8。推理顺序是 LoRA、教师、模板。对战接口不调用这条链。</p>
+    <p><span class="label">权衡。</span>小模型会说人话，不会因此记住图鉴。对战解说比较呆板，换来的是点击后立刻看到场面。</p>
+  </div>
+</section>
+
+<section>
+  <h2>40 条成文评测</h2>
+  <p>数字来自 <code>data/lora/eval_report.md</code>。这是口吻质量，不是产品准确率，也不是对战延迟。</p>
+  <table>
+    <tr><th></th><th>事实还在</th><th>像灯灯</th><th>配队说全</th><th>平均生成</th></tr>
+    <tr><td>云端教师</td><td>30/40</td><td>40/40</td><td>6/6</td><td>41.06 秒</td></tr>
+    <tr><td>未训练基座</td><td>16/40</td><td>9/40</td><td>0/6</td><td>9.09 秒</td></tr>
+    <tr><td>LoRA</td><td>17/40</td><td>38/40</td><td>1/6</td><td>15.81 秒</td></tr>
+  </table>
+  <p>人设从 9/40 提到 38/40，生成比教师快。事实和配队复述仍不如教师，所以不合格的句子会回退。没有资料的 10 题不进训练；产品在没有命中时不调用模型。</p>
+  <p>知识规模：32 只精灵 JSON，规则稿写明 18 种属性、579 条技能。</p>
+  <h2>亮点</h2>
+  <ul>
+    <li>检索主路径是结构化查找。向量和联网是开关。</li>
+    <li>生成之后有规则校验，失败有下一级。</li>
+    <li>道具不占回合。愿力强化先改第一栏。进化之力保持生命比例。</li>
+    <li>长任务用创建加轮询。步骤条能显示跳过原因。</li>
+    <li>训练拒绝 7B。评测分三列，只引用已跑完的表。</li>
+  </ul>
+</section>
+
+<section>
+  <h2>三分钟怎么点</h2>
+  <ol>
+    <li>打开 5173，以游客进入。演示名用「小洛克」。</li>
+    <li>智能配队发「偏防守」。指出 6 个名字来自程序。</li>
+    <li>检索先问库里有的精灵，再问库里没有的名字。后一句走哭腔。</li>
+    <li>打开联网开关。没配搜索密钥时，回答会写明这次没有联网。</li>
+    <li>模拟对战点「一键配招」，确认技能、血脉和道具，再开战。</li>
+  </ol>
+  <h2>下一步</h2>
+  <ul>
+    <li>若要更新数字，在 GPU 上重跑 <code>eval_lora.py</code>，只替换报告里的新结果。</li>
+    <li>LoRA 默认关闭，避免没有适配器时假装已经蒸馏。</li>
+    <li>界面截图若要放进下一版 PDF，先打码账号，且不要出现密钥。未授权的立绘不放。</li>
+  </ul>
+  <h2>待补的图</h2>
+  <p class="note">本 PDF 用框图和文字框代替截图。补拍后可替换：demo-team、demo-search、demo-battle（1440×900），arch-overview（1600×900），flow-lora（1400×800）。</p>
+  <footer>灯灯作品集 · 非官方 · 生成自 docs/career/portfolio-print.html</footer>
+</section>
+</body>
+</html>

@@ -37,7 +37,7 @@ _current_session_id: Optional[str] = None        # 当前对话对应的会话ID
 _conversation_sessions: Dict[int, str] = {}      # conversation_id -> session_id 映射
 
 
-def api_request(endpoint: str, method: str = "GET", data: dict = None) -> dict:
+def api_request(endpoint: str, method: str = "GET", data: dict = None, timeout: int = 60) -> dict:
     """发送 API 请求"""
     url = f"{API_BASE_URL}{endpoint}"
     headers = {"Content-Type": "application/json"}
@@ -49,7 +49,7 @@ def api_request(endpoint: str, method: str = "GET", data: dict = None) -> dict:
             json_data = json.dumps(data).encode('utf-8') if data else b'{}'
             req = urllib.request.Request(url, data=json_data, headers=headers, method=method)
         
-        with urllib.request.urlopen(req, timeout=60) as response:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
             return json.loads(response.read().decode('utf-8'))
     except urllib.error.HTTPError as e:
         error_body = e.read().decode('utf-8')
@@ -229,17 +229,17 @@ def delete_current_conversation() -> Tuple[str, gr.update, gr.update]:
     return f"❌ 删除失败: {result.get('message', '未知错误')}", gr.update(), gr.update()
 
 
-def answer_query(user_message: str) -> Tuple[str, List[str]]:
+def answer_query(user_message: str, use_agents: bool = False) -> Tuple[str, List[str], dict]:
     """回答问题 - 通过API服务"""
     global _current_session_id
 
     if not user_message.strip():
-        return "请输入要查询的问题。", []
+        return "请输入要查询的问题。", [], {}
     
     import re
     cleaned = re.sub(r'[？?！!。，,. ]', '', user_message)
     if not cleaned:
-        return "请输入具体的问题内容。", []
+        return "请输入具体的问题内容。", [], {}
     
     try:
         print(f"正在处理查询：{user_message[:50]}...")
@@ -258,57 +258,148 @@ def answer_query(user_message: str) -> Tuple[str, List[str]]:
         if _current_user:
             request_data["user_id"] = _current_user["user_id"]
         
-        result = api_request("/query", "POST", request_data)
+        endpoint = "/agents/query" if use_agents else "/query"
+        result = api_request(endpoint, "POST", request_data, timeout=900 if use_agents else 60)
         
         print(f"API返回结果: {result}")
         
         if result.get("status") == "error":
-            return f"API错误：{result.get('answer', '未知错误')}", []
+            return f"API错误：{result.get('answer', '未知错误')}", [], {}
+        if result.get("detail") and not result.get("answer"):
+            return f"API错误：{result.get('detail')}", [], {}
+        if result.get("message") and not result.get("answer") and result.get("success") is False:
+            return f"API错误：{result.get('message')}", [], {}
         
         answer_text = result.get("answer", "")
         sources = result.get("sources", [])
+        meta = {
+            "passed_check": result.get("passed_check"),
+            "rounds": result.get("rounds"),
+        }
         
         print(f"查询完成，答案长度: {len(answer_text)}, 来源数量: {len(sources)}")
-        return answer_text.strip(), sources
+        return answer_text.strip(), sources, meta
     except Exception as exc:
         error_msg = f"回答时发生错误：{exc}"
         print(error_msg)
-        return error_msg, []
+        return error_msg, [], {}
 
 
-def respond(user_message: str, chat_history: List):
-    """响应用户消息"""
-    global _current_user, _current_conversation_id
-    
-    print(f"=== respond函数被调用 ===")
-    print(f"用户消息: {user_message}")
-    print(f"当前历史长度: {len(chat_history) if chat_history else 0}")
-    
-    if not user_message.strip():
-        return "", chat_history
-    
-    answer, sources = answer_query(user_message)
-    
-    print(f"回答内容: {answer[:100] if len(answer) > 100 else answer}...")
-    
+def _chat_snapshot(history: List) -> List:
+    return [dict(item) for item in history]
+
+
+def _append_sources(answer: str, sources: List[str], passed_check, llm_calls) -> str:
+    text = answer or ""
+    if sources:
+        text += "\n\n---\n\n📚 参考来源（原文）\n"
+        for i, src in enumerate(sources, 1):
+            text += f"\n📄 **{i}.** {src}\n"
+    if passed_check is True:
+        flag = "核对通过"
+    elif passed_check is False:
+        flag = "核对未通过"
+    else:
+        flag = ""
+    if flag or llm_calls:
+        text += f"\n\n（{flag}，模型调用 {int(llm_calls or 0)} 次）"
+    return text
+
+
+def respond(user_message: str, chat_history: List, use_agents: bool = False):
+    """响应用户消息。配队走任务轮询，政策问答仍一次请求。"""
+    global _current_user, _current_conversation_id, _current_session_id
+
+    history = list(chat_history or [])
+    if not str(user_message or "").strip():
+        yield "", history, gr.update(), gr.update()
+        return
+
+    if not use_agents:
+        answer, sources, meta = answer_query(user_message, use_agents=False)
+        if _current_user and _current_conversation_id:
+            database.save_message(_current_conversation_id, "user", user_message)
+            database.save_message(_current_conversation_id, "assistant", answer, sources)
+        response_text = answer
+        if sources:
+            response_text += "\n\n---\n\n📚 参考来源（原文）\n"
+            for i, src in enumerate(sources, 1):
+                response_text += f"\n📄 **{i}.** {src}\n"
+        history.append({"role": "user", "content": user_message})
+        history.append({"role": "assistant", "content": response_text})
+        yield "", _chat_snapshot(history), answer, user_message
+        return
+
+    history.append({"role": "user", "content": user_message})
+    history.append({"role": "assistant", "content": "⏳ 正在提交配队任务…"})
+    yield "", _chat_snapshot(history), gr.update(), user_message
+
+    if not _current_session_id:
+        session_res = api_request("/session", "POST", {})
+        _current_session_id = session_res.get("session_id")
+    request_data = {
+        "question": user_message,
+        "session_id": _current_session_id or "",
+        "include_history": True,
+    }
+    if _current_user:
+        request_data["user_id"] = _current_user["user_id"]
+
+    created = api_request("/agents/jobs", "POST", request_data, timeout=20)
+    job_id = created.get("job_id")
+    if not job_id:
+        detail = created.get("detail") or created.get("message") or "提交失败"
+        history[-1] = {"role": "assistant", "content": f"❌ 卡在第 1 步：{detail}"}
+        yield "", _chat_snapshot(history), "", user_message
+        return
+
+    view = created
+    deadline = time.time() + 600
+    while time.time() < deadline:
+        if view.get("status") in {"done", "error"}:
+            break
+        message = view.get("message") or "正在处理…"
+        index = view.get("step_index") or 1
+        history[-1] = {"role": "assistant", "content": f"⏳ {message}（第 {index}/6 步）"}
+        yield "", _chat_snapshot(history), gr.update(), user_message
+        time.sleep(0.4)
+        view = api_request(f"/agents/jobs/{job_id}", timeout=15)
+    else:
+        history[-1] = {"role": "assistant", "content": "❌ 等待配队结果超时，请再试一次"}
+        yield "", _chat_snapshot(history), "", user_message
+        return
+
+    if view.get("status") == "error" or view.get("error"):
+        index = view.get("step_index") or 2
+        error = view.get("error") or view.get("message") or "配队失败"
+        history[-1] = {"role": "assistant", "content": f"❌ 卡在第 {index} 步：{error}"}
+        yield "", _chat_snapshot(history), "", user_message
+        return
+
+    answer = view.get("answer") or ""
+    sources = view.get("sources") or []
+    response_text = _append_sources(answer, sources, view.get("passed_check"), view.get("llm_calls"))
     if _current_user and _current_conversation_id:
         database.save_message(_current_conversation_id, "user", user_message)
         database.save_message(_current_conversation_id, "assistant", answer, sources)
-    
-    response_text = answer
-    if sources:
-        response_text += "\n\n---\n\n📚 参考来源（原文）\n"
-        for i, src in enumerate(sources, 1):
-            response_text += f"\n📄 **{i}.** {src}\n"
-    
-    new_history = chat_history.copy() if chat_history else []
-    new_history.append({"role": "user", "content": user_message})
-    new_history.append({"role": "assistant", "content": response_text})
-    
-    print(f"新历史长度: {len(new_history)}")
-    print(f"=== respond函数结束 ===")
-    
-    return "", new_history
+    history[-1] = {"role": "assistant", "content": response_text}
+    yield "", _chat_snapshot(history), answer, user_message
+
+
+def send_team_feedback(accepted: bool, correction: str, question: str, answer: str) -> str:
+    """把用户是否采纳这支队伍记下来，供后续 DPO。"""
+    if not str(answer or "").strip():
+        return "还没有可以评价的配队。"
+    result = api_request("/teams/feedback", "POST", {
+        "question": question or "",
+        "model_answer": answer,
+        "accepted": accepted,
+        "corrected_team": correction or "",
+    }, timeout=30)
+    if result.get("saved"):
+        return f"已记录。当前可用来做 DPO 的偏好对：{result.get('pairs', 0)} 条。奖励 {result.get('reward')}。"
+    detail = result.get("detail") or result.get("message") or "未知错误"
+    return f"记录失败：{detail}"
 
 
 def refresh_files():
@@ -368,7 +459,8 @@ def upload_user_document(file):
         
         url = f"{API_BASE_URL}/users/{user_id}/documents"
         
-        files = {"file": (os.path.basename(file), open(file, "rb"), "application/pdf")}
+        file_path = file if isinstance(file, str) else getattr(file, "name", "")
+        files = {"file": (os.path.basename(file_path), open(file_path, "rb"), "application/pdf")}
         
         response = requests.post(url, files=files, timeout=60)
         
@@ -506,9 +598,10 @@ def get_system_status():
 """
 
 
-with gr.Blocks(title="国家政策知识库智能问答") as demo:
-    gr.Markdown("# 🏛️ 国家政策知识库智能问答系统")
-    gr.Markdown("基于 RAG 技术的政策文档智能检索与问答系统")
+with gr.Blocks(title="洛克宠物自动配队") as demo:
+    gr.Markdown("# 洛克宠物自动配队")
+    gr.Markdown("配队只走一个助手。6 只精灵、每只 4 个技能、每只血脉和全队唯一战斗道具由程序校验或补全。必须有倾斜，输出 1 到 3 只，其余为联防。")
+    gr.Markdown("流程：检索名录 → 助手选 6 人 → 程序补技能/血脉/道具 → 核对。最耗时的是第 2 步，助手选出 6 只精灵。")
     
     with gr.Row():
         with gr.Column(scale=1):
@@ -571,15 +664,30 @@ with gr.Blocks(title="国家政策知识库智能问答") as demo:
         with gr.Column(scale=2):
             gr.Markdown("### 💬 对话窗口")
             
-            chatbot = gr.Chatbot(height=500)
+            chatbot = gr.Chatbot(height=500, type="messages")
+            use_agents = gr.Checkbox(
+                label="使用配队助手",
+                value=True,
+            )
+            last_answer = gr.State("")
+            last_question = gr.State("")
             
             with gr.Row():
                 user_input = gr.Textbox(
-                    label="输入问题",
-                    placeholder="请输入您的问题...",
+                    label="想要的队伍",
+                    placeholder="例如：以水灵为核心，配一支偏防守的队伍",
                     scale=4
                 )
-                submit_btn = gr.Button("发送", variant="primary", scale=1)
+                submit_btn = gr.Button("配队", variant="primary", scale=1)
+
+            with gr.Row():
+                accept_btn = gr.Button("这队可以")
+                reject_btn = gr.Button("这队不行")
+            correction = gr.Textbox(
+                label="更想要的队伍",
+                placeholder="不采纳时，按【队伍】格式写下你认可的成员",
+            )
+            feedback_status = gr.Markdown()
             
             with gr.Row():
                 refresh_btn = gr.Button("🔄 刷新知识库", scale=1)
@@ -627,14 +735,25 @@ with gr.Blocks(title="国家政策知识库智能问答") as demo:
     
     submit_btn.click(
         respond,
-        inputs=[user_input, chatbot],
-        outputs=[user_input, chatbot]
+        inputs=[user_input, chatbot, use_agents],
+        outputs=[user_input, chatbot, last_answer, last_question]
     )
     
     user_input.submit(
         respond,
-        inputs=[user_input, chatbot],
-        outputs=[user_input, chatbot]
+        inputs=[user_input, chatbot, use_agents],
+        outputs=[user_input, chatbot, last_answer, last_question]
+    )
+
+    accept_btn.click(
+        lambda correction, question, answer: send_team_feedback(True, correction, question, answer),
+        inputs=[correction, last_question, last_answer],
+        outputs=[feedback_status],
+    )
+    reject_btn.click(
+        lambda correction, question, answer: send_team_feedback(False, correction, question, answer),
+        inputs=[correction, last_question, last_answer],
+        outputs=[feedback_status],
     )
     
     refresh_btn.click(
@@ -702,13 +821,14 @@ if __name__ == "__main__":
     validate_config()
     
     print("=" * 50)
-    print("  国家政策知识库智能问答系统（带用户认证）")
+    print("  洛克宠物自动配队")
     print("=" * 50)
     print()
     print("正在启动 Gradio Web 服务...")
     print(f"启动后请在浏览器访问：http://127.0.0.1:7862")
     print()
     
+    demo.queue()
     demo.launch(
         share=False,
         server_name=os.getenv("GRADIO_SERVER_NAME", "127.0.0.1"),

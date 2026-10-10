@@ -3,8 +3,9 @@ chcp 65001 >nul
 set PYTHONIOENCODING=utf-8
 
 echo ========================================
-echo   国家政策知识库智能问答系统
-echo   （带用户认证和对话历史）
+echo   洛克王国智能助手
+echo   前端 http://127.0.0.1:5173
+echo   接口 http://127.0.0.1:8000
 echo ========================================
 echo.
 
@@ -24,14 +25,19 @@ call .venv\Scripts\activate.bat
 
 echo 正在启动 API 服务...
 echo API服务将初始化知识库（包括OCR处理）
-start "Policy QA API" cmd /c "python api.py & pause"
+start "Policy QA API" cmd /c "set HF_HUB_OFFLINE=1&& set TRANSFORMERS_OFFLINE=1&& set PYTHONIOENCODING=utf-8&& python -u api.py & pause"
 timeout /t 5 /nobreak >nul
 
-echo 正在启动 Gradio Web 服务...
-echo Web界面将直接使用API服务，无需重复OCR处理
-echo 启动后请在浏览器访问：http://127.0.0.1:7862
+echo 正在启动对话界面...
+echo 正式入口是 React 页面，不再打开 Gradio。
+echo 浏览器访问：http://127.0.0.1:5173
 echo.
 
-python app.py
+cd web
+if not exist node_modules (
+    echo 正在安装前端依赖...
+    npm install
+)
+npm run dev
 
 pause

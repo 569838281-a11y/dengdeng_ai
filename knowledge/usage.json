@@ -1,0 +1,14 @@
+{
+  "yesterday": {
+    "label": "前一天",
+    "date": "未提供",
+    "pokemon": [],
+    "teams": []
+  },
+  "last_month": {
+    "label": "上个月",
+    "date": "未提供",
+    "pokemon": [],
+    "teams": []
+  }
+}

@@ -651,3 +651,24 @@ def load_and_split_pdfs(
         print(f"共生成 {len(documents)} 个文档块")
     
     return documents
+
+
+def load_knowledge_documents() -> List[Document]:
+    """把规则、技能和特性板块变成可入库的文档。不收录精灵 JSON，也不收录整份原稿。"""
+    from pokemon_kb import rule_chunks
+
+    documents = []
+    for chunk in rule_chunks():
+        documents.append(
+            Document(
+                page_content=chunk["text"],
+                metadata={
+                    "source": "knowledge/rules.md",
+                    "section": chunk["section"],
+                    "page": "",
+                },
+            )
+        )
+    if documents:
+        print(f"知识库板块：{len(documents)} 个片段")
+    return documents

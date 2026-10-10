@@ -5,10 +5,14 @@ FallbackLLMProvider 实现"主备降级"策略。所有 invoke 统一走
 "超时重试 + 指数退避"（tenacity），主供应商重试耗尽后自动切换备用。
 """
 import logging
+import os
 from abc import ABC, abstractmethod
 from typing import Any, List, Optional, Union
 
 import tenacity
+
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 
 from config import (
     DEEPSEEK_API_KEY,
@@ -17,6 +21,9 @@ from config import (
     LLM_MAX_RETRIES,
     LLM_PROVIDER,
     LLM_TIMEOUT,
+    OPENAI_MODEL,
+    TEAM_LLM_MAX_RETRIES,
+    TEAM_LLM_TIMEOUT,
     ZHIPU_API_KEY,
     ZHIPU_BASE_URL,
 )
@@ -95,21 +102,21 @@ class BaseLLMProvider(ABC):
 
 
 class ZhipuProvider(BaseLLMProvider):
-    """智谱 GLM-4-flash（主供应商）"""
+    """智谱对话模型。型号来自 .env 的 OPENAI_MODEL。"""
 
     name = "zhipu"
 
     def __init__(
         self,
         api_key: str = ZHIPU_API_KEY,
-        model: str = "glm-4-flash",
+        model: str = "",
         base_url: str = ZHIPU_BASE_URL,
         timeout: int = LLM_TIMEOUT,
         max_retries: int = LLM_MAX_RETRIES,
     ):
         super().__init__(max_retries=max_retries)
         self.api_key = api_key
-        self.model = model
+        self.model = (model or OPENAI_MODEL).strip()
         # langchain_zhipu 4.1.x 的 _ask_remote 会把 "api/paas/v4/chat/completions"
         # 拼到 base_url 之后，因此 base_url 必须是裸域名；兼容旧的带后缀配置
         self.base_url = _normalize_zhipu_base_url(base_url)
@@ -118,7 +125,7 @@ class ZhipuProvider(BaseLLMProvider):
             raise LLMProviderError("缺少 ZHIPU_API_KEY")
         from langchain_zhipu import ChatZhipuAI
 
-        self._chat = ChatZhipuAI(api_key=api_key, model=model, base_url=self.base_url)
+        self._chat = ChatZhipuAI(api_key=api_key, model=self.model, base_url=self.base_url)
 
     @property
     def llm(self) -> Any:
@@ -216,6 +223,62 @@ def _normalize_zhipu_base_url(base_url: str) -> str:
     if url.endswith(suffix):
         url = url[: -len(suffix)]
     return url or "https://open.bigmodel.cn"
+
+
+class _BoundedChat:
+    """给配队调用加上硬超时。问答链仍用原来的模型实例。"""
+
+    def __init__(self, chat: Any, timeout: int):
+        self._chat = chat
+        self._timeout = timeout
+
+    def invoke(self, prompt: Union[str, List[Any]], **kwargs) -> Any:
+        pool = ThreadPoolExecutor(max_workers=1)
+        future = pool.submit(self._chat.invoke, prompt)
+        try:
+            result = future.result(timeout=self._timeout)
+        except FuturesTimeoutError as exc:
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise TimeoutError("配队助手等待模型超时") from exc
+        pool.shutdown(wait=False)
+        return result
+
+
+def _voice_timeout() -> int:
+    raw = os.getenv("VOICE_LLM_TIMEOUT", "120").strip()
+    try:
+        return max(TEAM_LLM_TIMEOUT, int(raw))
+    except ValueError:
+        return 120
+
+
+def get_team_invoke(timeout: int = None):
+    """云端成文。默认仍是配队那套短超时；灯灯包装传入更长的等待。"""
+    wait = TEAM_LLM_TIMEOUT if timeout is None else timeout
+    if LLM_PROVIDER == "deepseek":
+        provider: BaseLLMProvider = DeepSeekProvider(
+            timeout=wait,
+            max_retries=1,
+        )
+    else:
+        provider = ZhipuProvider(
+            timeout=wait,
+            max_retries=1,
+        )
+    provider._chat = _BoundedChat(provider._chat, wait)
+
+    def invoke(prompt: Union[str, List[Any]]) -> Any:
+        try:
+            return provider._chat.invoke(prompt)
+        except TimeoutError:
+            raise
+        except Exception as exc:
+            text = str(exc).lower()
+            if "配队助手等待模型超时" in str(exc) or "timed out" in text or "timeout" in text:
+                raise TimeoutError("配队助手等待模型超时") from exc
+            raise
+
+    return invoke
 
 
 def get_llm_provider() -> BaseLLMProvider:

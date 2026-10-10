@@ -105,7 +105,8 @@ def run_rebuild(
       同步合并 BM25 语料与父块缓存（修复"删除残留向量"缺陷）
     """
     from cache_utils import load_cache_with_meta, save_cache_with_meta
-    from document_processor import load_and_split_pdfs
+    from document_processor import load_and_split_pdfs, load_knowledge_documents
+    from pokemon_kb import KNOWLEDGE_SOURCE, knowledge_content_hash
     from vectorstore import (
         build_or_load_vectorstore,
         delete_documents_by_source,
@@ -117,11 +118,15 @@ def run_rebuild(
     data_path = Path(data_dir)
     current_pdfs = sorted([f.name for f in data_path.glob("*.pdf")]) if data_path.exists() else []
 
+    knowledge_hash = knowledge_content_hash()
+    knowledge_missing = KNOWLEDGE_SOURCE not in set((manifest or {}).get("source_files") or [])
     needs_full = (
         force
         or manifest is None
         or manifest.get("fingerprint") != compute_build_fingerprint()
         or not current_pdfs
+        or knowledge_missing
+        or (manifest or {}).get("knowledge_hash") != knowledge_hash
     )
 
     if needs_full:
@@ -137,6 +142,7 @@ def run_rebuild(
             child_overlap=CHILD_CHUNK_OVERLAP,
             augment_meta=USE_METADATA_AUGMENT,
         )
+        documents = documents + load_knowledge_documents()
         if not documents:
             raise RuntimeError("没有找到可用文档")
 
@@ -145,6 +151,9 @@ def run_rebuild(
         )
         save_cache_with_meta(Path(data_dir) / "_documents_cache.pkl", documents)
         manifest = read_manifest(persist_directory) or {}
+        manifest["knowledge_hash"] = knowledge_hash
+        manifest["source_files"] = sorted(set(manifest.get("source_files") or []) | {KNOWLEDGE_SOURCE})
+        write_manifest(persist_directory, manifest)
         result = {
             "status": "full",
             "active_collection": manifest.get("active_collection"),
@@ -155,7 +164,7 @@ def run_rebuild(
         return result
 
     # ---- 增量重建 ----
-    stored_files = set(manifest.get("source_files") or [])
+    stored_files = set(manifest.get("source_files") or []) - {KNOWLEDGE_SOURCE}
     current_set = set(current_pdfs)
     added = sorted(current_set - stored_files)
     removed = sorted(stored_files - current_set)
@@ -219,7 +228,8 @@ def run_rebuild(
     count = vectorstore._collection.count()
     write_manifest(persist_directory, {
         **manifest,
-        "source_files": current_pdfs,
+        "source_files": sorted(set(current_pdfs) | {KNOWLEDGE_SOURCE}),
+        "knowledge_hash": knowledge_hash,
         "document_count": count,
         "created_at": time.time(),
     })

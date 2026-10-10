@@ -1,7 +1,9 @@
 import os
+import re
 import sys
 import time
 import logging
+import asyncio
 import structlog
 import threading
 from pathlib import Path
@@ -15,7 +17,7 @@ if sys.stderr.encoding != "utf-8":
 
 from fastapi import FastAPI, HTTPException, Query, Request, Depends, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 import uuid
 import shutil
@@ -36,6 +38,7 @@ from config import (
     USE_MINERU,
     DOC_PROCESSOR as CONFIG_DOC_PROCESSOR,
     EMBEDDING_MODEL,
+    TEAM_USE_VECTOR,
 )
 import database
 from user_vectorstore import (
@@ -93,6 +96,7 @@ _parent_documents = None  # 保存父块文档用于ParentChildRetriever
 # 缓存嵌入模型和用户检索器
 _embeddings_cache = None
 _user_retrievers_cache: dict = {}  # {user_id: chain}
+_agent_retrievers_cache: dict = {}  # {user_id or 0: retriever}
 
 # RQ 任务跟踪：重建任务完成后 API 惰性重载检索链；用户文档任务完成后失效对应检索器缓存
 _rebuild_task_id: Optional[str] = None
@@ -119,6 +123,8 @@ def _ensure_directories() -> None:
 def _build_chain():
     global _chain, _file_list, _chain_building, _chain_error, _original_documents, _parent_documents
 
+    _user_retrievers_cache.clear()
+    _agent_retrievers_cache.clear()
     logger.info("开始构建检索链...")
 
     persist_path = Path(PERSIST_DIRECTORY)
@@ -175,13 +181,23 @@ def _build_chain():
         child_overlap=CHILD_CHUNK_OVERLAP,
         augment_meta=USE_METADATA_AUGMENT,
     )
+    if documents:
+        from document_processor import load_knowledge_documents
+        documents = documents + load_knowledge_documents()
     if not documents:
         logger.warning("没有找到可用文档")
         _chain_building = False
         return
 
     logger.info("构建向量数据库...")
-    vectorstore = build_or_load_vectorstore(documents)
+    try:
+        vectorstore = build_or_load_vectorstore(documents)
+    except Exception as exc:
+        logger.warning(f"向量库未建成，配队仍使用精灵资料和规则板块：{exc}")
+        _chain = None
+        _chain_error = str(exc)
+        _chain_building = False
+        return
     
     # 保存原始文档用于BM25混合检索，并缓存到磁盘
     _original_documents = documents
@@ -228,6 +244,7 @@ def _refresh_user_task_cache(user_id: int) -> None:
         status = job.get_status() if job is not None else "finished"
         if status in ("finished", "failed"):
             _user_retrievers_cache.pop(user_id, None)
+            _agent_retrievers_cache.pop(user_id, None)
             _pending_user_tasks.pop(user_id, None)
             logger.info(f"用户 {user_id} 文档任务 {status}，检索器缓存已失效")
     except Exception as e:
@@ -238,7 +255,7 @@ def _ensure_chain(wait: bool = False, timeout: int = 60):
     global _chain, _file_list, _chain_building, _chain_error, _build_start_time, _rebuild_task_id
 
     # 重建任务完成 -> 后台重载检索链（双缓冲区保证旧库服务到切换完成）
-    if _rebuild_task_id and _chain is not None:
+    if _rebuild_task_id and _rebuild_task_id != "local" and _chain is not None:
         try:
             job = fetch_job(_rebuild_task_id)
             if job is not None and job.get_status() in ("finished", "failed"):
@@ -284,6 +301,7 @@ class QueryRequest(BaseModel):
     session_id: Optional[str] = Field(default=None, description="会话ID（用于多轮对话）")
     include_history: bool = Field(default=False, description="是否包含对话历史")
     user_id: Optional[int] = Field(default=None, description="用户ID（用于长期记忆）")
+    use_web: bool = Field(default=False, description="检索信息是否联网搜寻")
 
 
 class SessionInfo(BaseModel):
@@ -295,6 +313,17 @@ class QueryResponse(BaseModel):
     answer: str = Field(..., description="回答内容")
     sources: List[str] = Field(default_factory=list, description="引用来源文件名")
     status: str = Field(default="success", description="状态: success / error / loading")
+
+class AgentQueryResponse(QueryResponse):
+    passed_check: bool = Field(default=False, description="核对员是否通过")
+    rounds: int = Field(default=1, description="撰写与核对的轮数")
+    trace_path: str = Field(default="", description="协作轨迹文件")
+
+class TeamFeedbackRequest(BaseModel):
+    question: str = Field(default="", description="用户的配队要求")
+    model_answer: str = Field(..., min_length=1, description="模型给出的队伍")
+    accepted: bool = Field(..., description="用户是否采纳")
+    corrected_team: str = Field(default="", description="用户改过的队伍，作为 DPO 的优选答案")
 
 class HealthResponse(BaseModel):
     status: str = Field(..., description="服务状态")
@@ -329,6 +358,11 @@ class UserRegisterRequest(BaseModel):
 class UserLoginRequest(BaseModel):
     username: str = Field(..., description="用户名")
     password: str = Field(..., description="密码")
+
+class ChangePasswordRequest(BaseModel):
+    username: str = Field(..., description="用户名")
+    old_password: str = Field(..., description="旧密码")
+    new_password: str = Field(..., min_length=6, max_length=100, description="新密码")
 
 class UserResponse(BaseModel):
     success: bool = Field(..., description="操作是否成功")
@@ -385,8 +419,7 @@ async def lifespan(app: FastAPI):
     _ensure_directories()
     database.init_database()
     logger.info("数据库初始化完成")
-    _ensure_chain(wait=True, timeout=120)
-    logger.info("知识库初始化完成")
+    logger.info("配队接口已就绪；向量问答链等真正提问时再加载")
     yield
     logger.info("应用关闭")
 
@@ -430,11 +463,22 @@ async def request_logging(request: Request, call_next):
 
 # --------------- Endpoints ---------------
 
+@app.get("/api/v1/mcp/tools", tags=["系统"])
+async def mcp_tools():
+    """列出文档 MCP Server 的工具名和参数 schema。"""
+    from agents.mcp_host import get_mcp_host
+
+    tools = get_mcp_host().list_tools()
+    return {"tools": tools}
+
+
 @app.get("/api/v1/health", response_model=HealthResponse, tags=["系统"])
 async def health_check():
     """健康检查端点，返回服务状态与知识库信息。"""
     rebuild_status = None
-    if _rebuild_task_id:
+    if _rebuild_task_id == "local":
+        rebuild_status = "started"
+    elif _rebuild_task_id:
         try:
             job = fetch_job(_rebuild_task_id)
             rebuild_status = job.get_status() if job is not None else "finished"
@@ -562,9 +606,12 @@ async def query(req: QueryRequest):
         
         if req.user_id and req.session_id and MEMORY_ENABLED and memory_manager:
             try:
-                conversation_id = req.session_id
                 memory_manager.save_long_term_memory(
-                    req.user_id, conversation_id, req.question, answer_text, sources
+                    req.user_id,
+                    database.get_conversation_id(req.user_id, req.session_id),
+                    req.question,
+                    answer_text,
+                    sources,
                 )
                 logger.info(f"已保存长期记忆: 用户={req.user_id}")
             except Exception as e:
@@ -574,6 +621,431 @@ async def query(req: QueryRequest):
     except Exception as exc:
         logger.error(f"查询失败: {exc}")
         raise HTTPException(status_code=500, detail=f"查询失败：{exc}")
+
+
+def _agent_retriever(user_id: Optional[int] = None):
+    """协作链路与主问答共用自适应检索、父子块和个人知识库。"""
+    cache_key = user_id or 0
+    cached = _agent_retrievers_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    vectorstore = build_or_load_vectorstore([])
+    from qa_chain import build_retriever
+    retriever = build_retriever(
+        vectorstore,
+        documents=_original_documents,
+        parent_documents=_parent_documents,
+        user_id=user_id,
+        adaptive=True,
+    )
+    _agent_retrievers_cache[cache_key] = retriever
+    return retriever
+
+
+def _remember_answer(req: QueryRequest, answer_text: str, sources: List[str]) -> None:
+    if req.session_id:
+        session_store.extend(req.session_id, [
+            {"role": "user", "content": req.question},
+            {"role": "assistant", "content": answer_text},
+        ])
+    if req.user_id and req.session_id and MEMORY_ENABLED and memory_manager:
+        try:
+            memory_manager.save_long_term_memory(
+                req.user_id,
+                database.get_conversation_id(req.user_id, req.session_id),
+                req.question,
+                answer_text,
+                sources,
+            )
+        except Exception as exc:
+            logger.error(f"保存长期记忆失败: {exc}")
+
+
+_AGENT_JOBS: dict = {}
+_AGENT_JOBS_LOCK = threading.Lock()
+_AGENT_JOB_TTL = 1800
+_AGENT_STEP_INDEX = {
+    "retrieve": 1,
+    "generate": 2,
+    "fill": 3,
+    "check": 4,
+    "rewrite": 5,
+    "done": 6,
+}
+
+
+def _cleanup_agent_jobs() -> None:
+    now = time.time()
+    with _AGENT_JOBS_LOCK:
+        stale = [
+            key for key, job in _AGENT_JOBS.items()
+            if now - job.get("created_at", now) > _AGENT_JOB_TTL
+        ]
+        for key in stale:
+            _AGENT_JOBS.pop(key, None)
+
+
+def _team_cards(job: dict):
+    answer = job.get("roster") or job.get("answer") or ""
+    if "队伍配置为" not in answer:
+        return None
+    from pokemon_kb import parse_team_config, skill_catalog, validate_team_answer
+    parsed = parse_team_config(answer)
+    catalog = skill_catalog()
+    members = []
+    for member in parsed.get("members") or []:
+        members.append({
+            "name": member.get("name") or "",
+            "tags": member.get("tags") or [],
+            "blood": member.get("blood") or "",
+            "skills": [
+                {
+                    "name": skill.get("name") or "",
+                    "source": skill.get("source") or "",
+                    "cost": (catalog.get(skill.get("name") or "") or {}).get("cost"),
+                    "raw": skill.get("raw") or skill.get("name") or "",
+                }
+                for skill in (member.get("skills") or [])[:4]
+            ],
+        })
+    if len(members) != 6 or any(not member["name"] for member in members):
+        return None
+    from agents.dengdeng_persona import contains_banned
+    question = job.get("question") or ""
+    if re.search(r"换为|换成|替换|改为|改成|删除|删掉|忘掉|查看|已有配队|放生", question) or re.search(
+        r"第\s*\d+\s*套|第[一二三四五六七八九十]+套", question
+    ):
+        question = ""
+    issues = [
+        issue for issue in validate_team_answer(answer, question)
+        if issue and not contains_banned(issue)
+    ]
+    return {
+        "members": members,
+        "item": parsed.get("item") or "",
+        "reason": parsed.get("reason") or "",
+        "issues": issues,
+    }
+
+
+def _clean_trace(text: str) -> str:
+    raw = str(text or "")
+    raw = re.sub(r"（boss=[^）]*）", "", raw)
+    raw = re.sub(r"\.json", "", raw, flags=re.IGNORECASE)
+    for word in ("文件", "写入", "配置", "调用", "接口", "函数", "代码", "数据库"):
+        raw = raw.replace(word, "")
+    raw = re.sub(r"json|mcp|api|pdf|csv|word", "", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"\s+", " ", raw).strip(" ，。；")
+    return raw[:96]
+
+
+def _append_job_trace(job: dict, kind: str, text: str) -> None:
+    cleaned = _clean_trace(text)
+    if not cleaned:
+        return
+    rows = job.setdefault("trace", [])
+    if rows and rows[-1].get("kind") == kind and rows[-1].get("text") == cleaned:
+        return
+    rows.append({"kind": kind, "text": cleaned})
+
+
+def _bind_job_thoughts(store: dict, lock: threading.Lock, job_id: str):
+    from agents.thoughts import bind
+
+    def emit(kind: str, text: str) -> None:
+        with lock:
+            job = store.get(job_id)
+            if job and job.get("status") != "error":
+                _append_job_trace(job, kind, text)
+
+    return bind(emit)
+
+
+def _knowledge_trace(step_id: str, status: str, detail: str) -> tuple:
+    detail = _clean_trace(detail)
+    if step_id == "parse" and status == "running":
+        return "thought", "灯灯先把这句话拆开"
+    if step_id == "parse" and status == "done":
+        return "thought", detail or "问句已经拆开"
+    if step_id == "lookup" and status == "running":
+        return "thought", "灯灯去名录和板块里翻"
+    if step_id == "lookup" and status == "done":
+        return "read", detail or "名录"
+    if step_id == "web" and status == "running":
+        return "thought", "本地没有的，灯灯到外面看一眼"
+    if step_id == "web" and status == "done":
+        return "read", detail or "外面的说法"
+    if step_id == "web" and status == "skip" and "未开启" in detail:
+        return "thought", "灯灯这次不到外面看"
+    if step_id == "web" and status == "skip" and "百科已经有了" in detail:
+        return "thought", "灯灯在百科里翻到了，不到外面看"
+    if step_id == "web" and status == "skip" and "这段对话里已经有了" in detail:
+        return "thought", "灯灯翻的是这段对话里记下的"
+    if step_id == "retrieve" and status == "done":
+        return "read", detail or "召回的片段"
+    if step_id == "generate" and status == "running":
+        return "thought", "灯灯把翻到的讲给小洛克"
+    if step_id == "generate" and status == "done":
+        return "thought", detail or "灯灯讲完了"
+    if step_id == "done" and status == "done":
+        return "thought", "灯灯把结果收好了"
+    return "", ""
+
+
+def _agent_job_view(job: dict) -> dict:
+    return {
+        "job_id": job.get("job_id", ""),
+        "status": job.get("status", "running"),
+        "step": job.get("step", "retrieve"),
+        "step_index": job.get("step_index", 1),
+        "step_total": 6,
+        "message": job.get("message", ""),
+        "answer": job.get("answer", ""),
+        "sources": job.get("sources") or [],
+        "passed_check": bool(job.get("passed_check")),
+        "llm_calls": int(job.get("llm_calls") or 0),
+        "error": job.get("error", ""),
+        "team": _team_cards(job),
+        "trial": job.get("trial"),
+        "trace": list(job.get("trace") or []),
+    }
+
+
+def _team_retriever(user_id: Optional[int]):
+    """默认不建向量检索。只有 TEAM_USE_VECTOR=true 才调用嵌入模型。"""
+    if not TEAM_USE_VECTOR:
+        return None
+    current_chain, _current_files = _ensure_chain(wait=False, timeout=5)
+    if current_chain is None:
+        return None
+    try:
+        if user_id:
+            _refresh_user_task_cache(user_id)
+        return _agent_retriever(user_id)
+    except Exception as exc:
+        logger.warning(f"向量检索不可用，只使用精灵资料: {exc}")
+        return None
+
+
+def _job_cancelled(store: dict, lock: threading.Lock, job_id: str) -> bool:
+    with lock:
+        job = store.get(job_id)
+        token = job.get("cancel") if job else None
+        return bool(token is not None and token.is_set())
+
+
+def _execute_team(req: QueryRequest, on_progress=None, cancel=None):
+    from agents.pipeline import run_collaborative_agents
+    from pokemon_kb import catalog_ready
+
+    if not catalog_ready():
+        raise HTTPException(status_code=503, detail="还没有精灵资料。请把 JSON 放进 knowledge/pokemon/。")
+
+    return run_collaborative_agents(
+        req.question,
+        on_progress=on_progress,
+        session_id=req.session_id or "",
+        cancel=cancel,
+    )
+
+
+def _run_agent_job(job_id: str, req: QueryRequest) -> None:
+    time.sleep(0.15)
+    pending_done = {"message": "配队完成"}
+
+    def on_progress(step: str, message: str) -> None:
+        with _AGENT_JOBS_LOCK:
+            job = _AGENT_JOBS.get(job_id)
+            if job and job.get("status") != "error":
+                _append_job_trace(job, "thought", message)
+        if step == "done":
+            pending_done["message"] = message
+            return
+        with _AGENT_JOBS_LOCK:
+            job = _AGENT_JOBS.get(job_id)
+            if not job or job.get("status") == "error":
+                return
+            job["step"] = step
+            job["step_index"] = _AGENT_STEP_INDEX.get(step, job.get("step_index", 1))
+            job["message"] = message
+            job["status"] = "running"
+
+    try:
+        from agents.thoughts import reset
+
+        token = _bind_job_thoughts(_AGENT_JOBS, _AGENT_JOBS_LOCK, job_id)
+        try:
+            trace = _execute_team(req, on_progress, cancel=lambda: _job_cancelled(_AGENT_JOBS, _AGENT_JOBS_LOCK, job_id))
+        finally:
+            reset(token)
+        if _job_cancelled(_AGENT_JOBS, _AGENT_JOBS_LOCK, job_id):
+            with _AGENT_JOBS_LOCK:
+                job = _AGENT_JOBS.get(job_id)
+                if job:
+                    job["status"] = "superseded"
+                    job["message"] = "灯灯改看新的要求"
+            return
+        answer_text = (trace.get("answer") or "").strip()
+        sources = trace.get("sources") or []
+        _remember_answer(req, answer_text, sources)
+        with _AGENT_JOBS_LOCK:
+            job = _AGENT_JOBS.get(job_id)
+            if not job:
+                return
+            job["answer"] = answer_text
+            job["roster"] = trace.get("roster") or ""
+            job["trial"] = trace.get("trial")
+            job["sources"] = sources
+            job["passed_check"] = bool(trace.get("passed"))
+            job["llm_calls"] = int(trace.get("llm_calls") or 0)
+            job["step"] = "done"
+            job["step_index"] = 6
+            job["message"] = pending_done["message"]
+            job["status"] = "done"
+            job["error"] = ""
+    except TimeoutError:
+        with _AGENT_JOBS_LOCK:
+            job = _AGENT_JOBS.get(job_id)
+            if not job:
+                return
+            job["status"] = "error"
+            job["error"] = "配队助手等待模型超时"
+    except Exception as exc:
+        logger.error(f"配队任务失败: {exc}")
+        detail = getattr(exc, "detail", None) or str(exc)
+        text = str(detail)
+        if "timed out" in text.lower() or "timeout" in text.lower():
+            text = "配队助手等待模型超时"
+        with _AGENT_JOBS_LOCK:
+            job = _AGENT_JOBS.get(job_id)
+            if not job:
+                return
+            job["status"] = "error"
+            job["error"] = text
+
+
+@app.post("/api/v1/agents/query", response_model=AgentQueryResponse, tags=["问答"])
+async def query_with_agents(req: QueryRequest):
+    """一个配队助手。给脚本同步调用。网页改走 /agents/jobs。"""
+    try:
+        trace = _execute_team(req)
+    except TimeoutError:
+        raise HTTPException(status_code=504, detail="配队助手等待模型超时")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"配队失败: {exc}")
+        text = str(exc)
+        if "timed out" in text.lower() or "timeout" in text.lower():
+            raise HTTPException(status_code=504, detail="配队助手等待模型超时")
+        raise HTTPException(status_code=500, detail=f"配队失败：{exc}")
+
+    answer_text = (trace.get("answer") or "").strip()
+    sources = trace.get("sources") or []
+    _remember_answer(req, answer_text, sources)
+    return AgentQueryResponse(
+        answer=answer_text,
+        sources=sources,
+        status="success",
+        passed_check=bool(trace.get("passed")),
+        rounds=len(trace.get("rounds") or []),
+        trace_path=trace.get("trace_path") or "",
+    )
+
+
+class FollowupRequest(BaseModel):
+    previous: str = ""
+    incoming: str = ""
+    supersede_job_ids: List[str] = Field(default_factory=list)
+
+
+def _supersede_job(job_id: str) -> None:
+    for store, lock in ((_AGENT_JOBS, _AGENT_JOBS_LOCK), (_KNOWLEDGE_JOBS, _KNOWLEDGE_JOBS_LOCK)):
+        with lock:
+            job = store.get(job_id)
+            if not job:
+                continue
+            token = job.get("cancel")
+            if token is not None:
+                token.set()
+            if job.get("status") == "running":
+                job["status"] = "superseded"
+                job["message"] = "灯灯改看新的要求"
+
+
+@app.post("/api/v1/followup", tags=["问答"])
+async def follow_up(req: FollowupRequest):
+    """思考未完成时，判断后一句是加条件还是另起任务，并停掉还在跑的旧任务。"""
+    from agents.followup import split_followup
+
+    for job_id in req.supersede_job_ids or []:
+        if job_id:
+            _supersede_job(job_id)
+    return split_followup(req.previous, req.incoming)
+
+
+@app.post("/api/v1/agents/jobs", tags=["问答"])
+async def create_agent_job(req: QueryRequest):
+    """立刻返回 job_id，配队在后台线程里跑。"""
+    from pokemon_kb import catalog_ready
+    if not catalog_ready():
+        raise HTTPException(status_code=503, detail="还没有精灵资料。请把 JSON 放进 knowledge/pokemon/。")
+    _cleanup_agent_jobs()
+    job_id = uuid.uuid4().hex
+    job = {
+        "job_id": job_id,
+        "status": "running",
+        "step": "retrieve",
+        "step_index": 1,
+        "step_total": 6,
+        "message": "正在检索精灵名录和规则…",
+        "answer": "",
+        "sources": [],
+        "passed_check": False,
+        "llm_calls": 0,
+        "error": "",
+        "trace": [{"kind": "thought", "text": "灯灯开始想"}],
+        "created_at": time.time(),
+        "question": req.question,
+        "cancel": threading.Event(),
+    }
+    with _AGENT_JOBS_LOCK:
+        _AGENT_JOBS[job_id] = job
+    snapshot = _agent_job_view(job)
+
+    async def _kickoff():
+        await asyncio.sleep(0.05)
+        threading.Thread(target=_run_agent_job, args=(job_id, req), daemon=True).start()
+
+    asyncio.create_task(_kickoff())
+    return snapshot
+
+
+@app.get("/api/v1/agents/jobs/{job_id}", tags=["问答"])
+async def get_agent_job(job_id: str):
+    """轮询配队步骤。"""
+    _cleanup_agent_jobs()
+    with _AGENT_JOBS_LOCK:
+        job = _AGENT_JOBS.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="找不到这支配队任务")
+        return _agent_job_view(job)
+
+
+@app.post("/api/v1/teams/feedback", tags=["配队学习"])
+async def team_feedback(req: TeamFeedbackRequest):
+    """记录采纳、拒绝和用户改写。有对比时写成 DPO 偏好对。"""
+    from pokemon_kb import record_feedback
+    return record_feedback(req.question, req.model_answer, req.accepted, req.corrected_team)
+
+
+@app.post("/api/v1/skills/export", tags=["技能蒸馏"])
+async def export_skill_dataset():
+    """把核对通过的撰写员轨迹导出为 LoRA 训练集。"""
+    from agents.skill_distill import export_dataset
+    result = export_dataset()
+    return result
 
 
 @app.get("/api/v1/files", response_model=FileListResponse, tags=["知识库"])
@@ -607,8 +1079,25 @@ async def rebuild_knowledge_base(force: bool = Query(default=False, description=
     try:
         task = enqueue_rebuild(force=force)
     except Exception as e:
-        logger.error(f"重建任务入队失败: {e}")
-        raise HTTPException(status_code=503, detail="任务队列不可用，请确认 Redis 与 worker 已启动")
+        logger.warning(f"重建任务入队失败，改为本进程后台重建: {e}")
+        _rebuild_task_id = "local"
+
+        def _local_rebuild():
+            global _rebuild_task_id
+            try:
+                from tasks import run_rebuild
+                run_rebuild(force=force)
+                _reload_chain_async()
+            except Exception as exc:
+                logger.error(f"本进程重建失败: {exc}")
+            finally:
+                _rebuild_task_id = None
+
+        threading.Thread(target=_local_rebuild, daemon=True).start()
+        return RebuildResponse(
+            status="started",
+            message="Redis 不可用，已在本进程后台重建知识库。完成后刷新页面即可使用新资料",
+        )
 
     _rebuild_task_id = task.id
     logger.info(f"重建任务已入队: {task.id}（force={force}）")
@@ -626,6 +1115,14 @@ async def get_task_status(task_id: str):
     - status: queued / started / finished / failed
     - finished 时返回 result；failed 时返回精简错误信息（不暴露堆栈）
     """
+    if task_id == "local":
+        running = _rebuild_task_id == "local"
+        return {
+            "task_id": "local",
+            "status": "started" if running else "finished",
+            "result": None,
+            "error": None,
+        }
     try:
         job = fetch_job(task_id)
     except Exception as e:
@@ -725,6 +1222,8 @@ async def delete_session(session_id: str):
         raise HTTPException(status_code=404, detail="会话不存在")
 
     session_store.delete(session_id)
+    from agents.chat_notebook import drop
+    drop(session_id)
     logger.info(f"删除会话: {session_id}")
     return {"status": "deleted", "session_id": session_id}
 
@@ -765,6 +1264,293 @@ async def login_user(req: UserLoginRequest):
     """
     result = database.login_user(req.username, req.password)
     return UserResponse(**result)
+
+
+@app.post("/api/v1/auth/change-password", response_model=UserResponse, tags=["用户认证"])
+async def change_password(req: ChangePasswordRequest):
+    """核对旧密码后更新。游客没有用户名，不能调用。"""
+    result = database.change_password(req.username, req.old_password, req.new_password)
+    return UserResponse(**result)
+
+
+@app.get("/api/v1/photos", tags=["立绘"])
+async def list_photos():
+    """已记录精灵的立绘对照：exact / stem / missing。"""
+    from photos import photo_inventory
+    rows = photo_inventory()
+    return {
+        "total": len(rows),
+        "ready": sum(1 for row in rows if row["match"] != "missing"),
+        "missing": [row["name"] for row in rows if row["match"] == "missing"],
+        "items": rows,
+    }
+
+
+@app.get("/api/v1/photo/{name}", tags=["立绘"])
+async def get_photo(name: str, form: str = "base"):
+    """按完整名字或去掉形态括号后的主名读取 PNG。form=boss 时先找首领化图。禁止目录穿越。"""
+    from photos import resolve_photo
+    path, match = resolve_photo(name, "boss" if form == "boss" else "base")
+    if path is None:
+        raise HTTPException(status_code=404, detail="暂无立绘")
+    return FileResponse(path, media_type="image/png", headers={"X-Photo-Match": match})
+
+
+@app.get("/api/v1/pokemon", tags=["精灵"])
+async def list_recorded_pokemon():
+    from pokemon_kb import load_pokemon
+    from photos import resolve_photo
+    rows = []
+    for mon in load_pokemon():
+        _path, match = resolve_photo(mon["name"])
+        rows.append({
+            "name": mon["name"],
+            "types": mon.get("types") or [],
+            "style": mon.get("style") or "",
+            "can_boss": str(mon.get("can_boss") or "").strip() == "是",
+            "photo": match,
+        })
+    return rows
+
+
+@app.get("/api/v1/pokemon/{name}/skills", tags=["精灵"])
+async def pokemon_skills(name: str):
+    from pokemon_kb import _by_name, elf_skill_options, load_pokemon
+    mon = _by_name(load_pokemon()).get(name)
+    if not mon:
+        raise HTTPException(status_code=404, detail="知识库没有这只精灵")
+    return [
+        {
+            "name": skill["name"],
+            "source": skill["source"],
+            "blood_type": skill.get("blood_type") or "",
+            "category": skill.get("category") or "",
+            "cost": int(skill.get("cost") or 0),
+            "power": int(skill.get("power") or 0),
+            "damage": skill.get("damage") or "",
+        }
+        for skill in elf_skill_options(mon)
+    ]
+
+
+@app.post("/api/v1/knowledge/search", tags=["检索"])
+async def knowledge_search(req: QueryRequest):
+    """同步兜底。网页检索改走 /knowledge/jobs。"""
+    from knowledge_search import search_knowledge
+    return search_knowledge(req.question)
+
+
+_KNOWLEDGE_JOBS: dict = {}
+_KNOWLEDGE_JOBS_LOCK = threading.Lock()
+_KNOWLEDGE_JOB_TTL = 1800
+
+
+def _cleanup_knowledge_jobs() -> None:
+    now = time.time()
+    with _KNOWLEDGE_JOBS_LOCK:
+        stale = [
+            key for key, job in _KNOWLEDGE_JOBS.items()
+            if now - job.get("created_at", now) > _KNOWLEDGE_JOB_TTL
+        ]
+        for key in stale:
+            _KNOWLEDGE_JOBS.pop(key, None)
+
+
+def _knowledge_job_view(job: dict) -> dict:
+    return {
+        "job_id": job.get("job_id", ""),
+        "status": job.get("status", "running"),
+        "message": job.get("message", ""),
+        "answer": job.get("answer", ""),
+        "hits": job.get("hits") or [],
+        "sources": job.get("sources") or [],
+        "web_sources": job.get("web_sources") or [],
+        "trial": job.get("trial"),
+        "steps": [dict(step) for step in (job.get("steps") or [])],
+        "error": job.get("error", ""),
+        "trace": list(job.get("trace") or []),
+    }
+
+
+def _report_knowledge_step(job_id: str, step_id: str, status: str, detail: str, message: str) -> None:
+    with _KNOWLEDGE_JOBS_LOCK:
+        job = _KNOWLEDGE_JOBS.get(job_id)
+        if not job or job.get("status") == "error":
+            return
+        for step in job.get("steps") or []:
+            if step.get("id") == step_id:
+                step["status"] = status
+                step["detail"] = detail or step.get("detail") or ""
+                break
+        if message:
+            job["message"] = message
+        kind, line = _knowledge_trace(step_id, status, detail or message)
+        if kind:
+            _append_job_trace(job, kind, line)
+
+
+def _run_knowledge_job(job_id: str, question: str, use_web: bool = False, session_id: str = "") -> None:
+    from knowledge_search import run_knowledge_search
+
+    time.sleep(0.15)
+
+    def report(step_id: str, status: str, detail: str, message: str) -> None:
+        _report_knowledge_step(job_id, step_id, status, detail, message)
+
+    try:
+        from agents.thoughts import reset
+
+        token = _bind_job_thoughts(_KNOWLEDGE_JOBS, _KNOWLEDGE_JOBS_LOCK, job_id)
+        try:
+            result = run_knowledge_search(question, report, use_web=bool(use_web), session_id=session_id)
+        finally:
+            reset(token)
+        if _job_cancelled(_KNOWLEDGE_JOBS, _KNOWLEDGE_JOBS_LOCK, job_id):
+            with _KNOWLEDGE_JOBS_LOCK:
+                job = _KNOWLEDGE_JOBS.get(job_id)
+                if job:
+                    job["status"] = "superseded"
+                    job["message"] = "灯灯改看新的要求"
+            return
+        with _KNOWLEDGE_JOBS_LOCK:
+            job = _KNOWLEDGE_JOBS.get(job_id)
+            if not job:
+                return
+            job["answer"] = result.get("answer") or ""
+            job["hits"] = result.get("hits") or []
+            job["sources"] = result.get("sources") or []
+            job["web_sources"] = result.get("web_sources") or []
+            job["trial"] = result.get("trial")
+            job["status"] = "done"
+            job["error"] = ""
+            job["message"] = "检索完成"
+    except Exception as exc:
+        logger.error(f"检索任务失败: {exc}")
+        with _KNOWLEDGE_JOBS_LOCK:
+            job = _KNOWLEDGE_JOBS.get(job_id)
+            if not job:
+                return
+            job["status"] = "error"
+            job["error"] = str(exc)
+            job["message"] = "检索失败"
+            for step in job.get("steps") or []:
+                if step.get("status") == "running":
+                    step["status"] = "error"
+                    step["detail"] = step.get("detail") or "这一步失败了"
+                    break
+
+
+@app.post("/api/v1/knowledge/jobs", tags=["检索"])
+async def create_knowledge_job(req: QueryRequest):
+    """立刻返回 job_id。结构化检索和 RAG 在后台线程里推进步骤。"""
+    from knowledge_search import blank_steps
+
+    _cleanup_knowledge_jobs()
+    job_id = uuid.uuid4().hex
+    steps = blank_steps()
+    steps[0]["status"] = "running"
+    steps[0]["detail"] = "正在理解问题…"
+    job = {
+        "job_id": job_id,
+        "status": "running",
+        "message": "正在理解问题…",
+        "answer": "",
+        "hits": [],
+        "sources": [],
+        "web_sources": [],
+        "trial": None,
+        "steps": steps,
+        "error": "",
+        "trace": [{"kind": "thought", "text": "灯灯开始想"}],
+        "created_at": time.time(),
+        "question": req.question,
+        "cancel": threading.Event(),
+    }
+    with _KNOWLEDGE_JOBS_LOCK:
+        _KNOWLEDGE_JOBS[job_id] = job
+    snapshot = _knowledge_job_view(job)
+
+    async def _kickoff():
+        await asyncio.sleep(0.05)
+        threading.Thread(
+            target=_run_knowledge_job,
+            args=(job_id, req.question, bool(req.use_web), req.session_id or ""),
+            daemon=True,
+        ).start()
+
+    asyncio.create_task(_kickoff())
+    return snapshot
+
+
+@app.get("/api/v1/knowledge/jobs/{job_id}", tags=["检索"])
+async def get_knowledge_job(job_id: str):
+    """轮询检索步骤。"""
+    _cleanup_knowledge_jobs()
+    with _KNOWLEDGE_JOBS_LOCK:
+        job = _KNOWLEDGE_JOBS.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="找不到这项检索任务")
+        return _knowledge_job_view(job)
+
+
+class BattleSide(BaseModel):
+    name: str
+    skills: List[str]
+    blood: str
+    item: str
+
+
+class BattleStartRequest(BaseModel):
+    player: BattleSide
+    enemy: BattleSide
+
+
+class BattleMoveRequest(BaseModel):
+    action: str = "skill"
+    skill: str = ""
+    item: str = ""
+
+
+class BattleOrderRequest(BaseModel):
+    question: str = Field(..., min_length=1, max_length=500)
+
+
+@app.post("/api/v1/battle/orders", tags=["对战"])
+async def battle_orders(req: BattleOrderRequest):
+    from agents.battle_orders import run_battle_order
+
+    return run_battle_order(req.question)
+
+
+@app.post("/api/v1/battle/start", tags=["对战"])
+async def battle_start(req: BattleStartRequest):
+    from battle import start_battle
+    result = start_battle(req.player.model_dump(), req.enemy.model_dump())
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("errors") or ["无法开战"])
+    note = (result.get("battle") or {}).get("note") or ""
+    result["narration"] = _battle_narration([note] if note else [], "")
+    result["narration_pending"] = False
+    return result
+
+
+def _battle_narration(lines, winner: str = "") -> str:
+    """当场短解说。不加载 LoRA，也不等云端 teacher。"""
+    from agents.dengdeng_persona import fallback_battle
+
+    return fallback_battle(lines, winner)
+
+
+@app.post("/api/v1/battle/{battle_id}/move", tags=["对战"])
+async def battle_move(battle_id: str, req: BattleMoveRequest):
+    from battle import play_move
+    result = play_move(battle_id, req.skill, req.action or "skill", req.item)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("errors") or ["无法行动"])
+    winner = (result.get("battle") or {}).get("winner") or ""
+    result["narration"] = _battle_narration(result.get("lines") or [], winner)
+    result["narration_pending"] = False
+    return result
 
 
 @app.get("/api/v1/auth/user/{user_id}", tags=["用户认证"])
@@ -912,6 +1698,7 @@ async def delete_user_document(user_id: int, document_id: int):
 
     # 1. 清空用户级检索器缓存（无论后续清理是否成功，检索器都必须重建）
     _user_retrievers_cache.pop(user_id, None)
+    _agent_retrievers_cache.pop(user_id, None)
     logger.info(f"已清空用户 {user_id} 的检索器缓存")
     
     # 2. 删除源文件（尽力而为）
@@ -1009,6 +1796,26 @@ async def get_user_conversations(
         ))
     
     return result
+
+
+class ChatMessageCreate(BaseModel):
+    user_id: int
+    role: str
+    content: str
+
+
+@app.post("/api/v1/conversations/{conversation_id}/messages", tags=["对话历史"])
+async def append_conversation_message(conversation_id: int, req: ChatMessageCreate):
+    """把一条消息写入已有对话。只能写自己的对话。"""
+    owner = database.conversation_owner(conversation_id)
+    if owner is None:
+        raise HTTPException(status_code=404, detail="对话不存在")
+    if owner != req.user_id:
+        raise HTTPException(status_code=403, detail="不能写入别人的对话")
+    if req.role not in {"user", "assistant"}:
+        raise HTTPException(status_code=400, detail="角色只能是 user 或 assistant")
+    message_id = database.save_message(conversation_id, req.role, req.content)
+    return {"id": message_id}
 
 
 @app.get("/api/v1/conversations/{conversation_id}", response_model=List[MessageResponse], tags=["对话历史"])

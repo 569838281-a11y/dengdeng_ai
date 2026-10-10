@@ -12,6 +12,8 @@ from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain.chains import create_retrieval_chain, create_history_aware_retriever
 from langchain.chains.history_aware_retriever import create_history_aware_retriever
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
+from langchain_core.retrievers import BaseRetriever
+from pydantic import Field
 
 from config import (
     USE_RERANKER, 
@@ -46,7 +48,7 @@ CONTEXTUALIZE_PROMPT = ChatPromptTemplate.from_messages([
 ])
 
 QA_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", """你是一个国家政策咨询助手，根据已知政策内容回答用户问题。
+    ("system", """你是洛克宠物配队助手，只根据已知资料组队。
 
 已知内容：
 {context}
@@ -54,27 +56,12 @@ QA_PROMPT = ChatPromptTemplate.from_messages([
 {memory_context}
 
 回答要求：
-1. **强制规则**：如果检索到的片段中均未直接提及用户问题关键词，必须回答"在所有已上传的政策文件中均未检索到相关信息"，严禁自行编造原因或推测。
-
-2. **引用归因规则**：
-   - 必须根据内容归属引用来源，禁止将排名靠前的文档默认为唯一来源
-   - 如果答案引用了特定条款，请严格标注该条款所属的具体文件名和页码
-   - 如果多个文档提及同一内容，请并列列出所有来源
-   - 使用[citation:X]标签标注引用，例如："根据[citation:1]第3页..."
-
-2. 尽可能从已知内容中提取相关信息回答问题，即使内容不完整也要尝试回答。
-
-3. 回答时要标注引用来源，格式示例：参考来源：政策文件名.pdf。
-
-4. 不要编造未在已知内容中出现的政策信息。
-
-5. 如果问题与政策无关（如询问时间）但是能得到明确正确的答案时，请直接说明答案且说明与政策无关。
-
-6. **重要**：仔细查看对话历史和长期记忆，记住用户之前问过的所有问题和你的回答。当用户询问"我之前问了什么"、"我刚才问的问题"等时，请从对话历史中准确找出并回答。
-
-7. 保持回答的连贯性和一致性，引用对话历史和长期记忆中的具体内容。
-
-8. **检索质量说明**：如果检索到的片段与问题相关性较低，请明确指出"检索到的内容与问题相关性较低"，不要强行关联。"""),
+1. 只根据「已知内容」里的对战细则、属性、特性、种族值、个体值、技能池、战斗风格和使用率配队。没有的事实不要编造。
+2. 用户点名的主力必须留在队伍里。提到上个月就用上个月的使用率，否则用前一天的使用率。
+3. 已知内容里每段开头有 [citation:X]。引用时沿用这个标签，并写出文件名。
+4. 输出【队伍】和【理由】。队伍应有 6 只，招式必须来自该洛克宠物自己的技能池。
+5. 资料不足时直接说明，不要用常识凑队伍。
+6. 用户询问之前说过什么时，从对话历史和长期记忆中回答。"""),
     MessagesPlaceholder("chat_history"),
     ("human", "{input}"),
 ])
@@ -131,7 +118,7 @@ def build_retriever(
             ret = create_hybrid_retriever(
                 vectorstore,
                 documents,
-                k=RETRIEVAL_K,
+                k=int(cfg.get("retrieval_k") or RETRIEVAL_K),
                 use_reranker=USE_RERANKER,
                 reranker_top_k=RERANKER_TOP_K,
                 reranker_threshold=RERANKER_THRESHOLD,
@@ -179,8 +166,8 @@ def build_retriever(
             # 先查数据库，确认用户是否真的上传过文件
             has_db_uploads = False
             try:
-                from database import get_user_uploads
-                uploads = get_user_uploads(user_id)
+                from database import get_user_documents
+                uploads = get_user_documents(user_id)
                 has_db_uploads = len(uploads) > 0
             except Exception:
                 has_db_uploads = False
@@ -218,6 +205,34 @@ def build_retriever(
     return retriever
 
 
+class CitationLabelRetriever(BaseRetriever):
+    """给检索片段加上 [citation:N]，让模型引用的编号和片段一致。"""
+
+    base_retriever: Any = Field(default=None)
+
+    class Config:
+        arbitrary_types_allowed = True
+
+    def _get_relevant_documents(self, query: str, *, run_manager=None, **kwargs) -> List[Document]:
+        docs = self.base_retriever.invoke(query)
+        labeled = []
+        for i, doc in enumerate(docs, 1):
+            source = doc.metadata.get("source") or doc.metadata.get("file_name") or "未知来源"
+            page = doc.metadata.get("page", "")
+            page_info = f" (第{page}页)" if str(page) else ""
+            body = doc.page_content.strip()
+            if body.startswith("[citation:"):
+                body = body.split("\n", 1)[-1].strip()
+            labeled.append(Document(
+                page_content=f"[citation:{i}] 文件: {source}{page_info}\n{body}",
+                metadata={**doc.metadata, "citation_id": i},
+            ))
+        return labeled
+
+    async def _aget_relevant_documents(self, query: str, *, run_manager=None, **kwargs) -> List[Document]:
+        return self._get_relevant_documents(query, run_manager=run_manager)
+
+
 def build_conversational_qa_chain(vectorstore: Chroma, documents: List[Document] = None, user_id: int = None, parent_documents: List[Document] = None):
     """构建支持多轮对话的检索问答链
     
@@ -233,9 +248,6 @@ def build_conversational_qa_chain(vectorstore: Chroma, documents: List[Document]
     # 策略模式：通过供应商抽象获取模型实例，主备降级与超时重试由 llm_provider 层负责
     llm_provider = get_llm_provider()
     llm = llm_provider.llm
-    # 策略模式：通过供应商抽象获取模型实例，主备降级与超时重试由 llm_provider 层负责
-    llm_provider = get_llm_provider()
-    llm = llm_provider.llm
 
     retriever = build_retriever(
         vectorstore,
@@ -244,6 +256,7 @@ def build_conversational_qa_chain(vectorstore: Chroma, documents: List[Document]
         user_id=user_id,
         adaptive=USE_ADAPTIVE_RETRIEVAL,
     )
+    retriever = CitationLabelRetriever(base_retriever=retriever)
     history_aware_retriever = create_history_aware_retriever(
         llm, retriever, CONTEXTUALIZE_PROMPT
     )
@@ -364,6 +377,8 @@ def extract_sources(source_documents: List[Document], max_content_length: int = 
         page = doc.metadata.get("page", "")
         
         content = doc.page_content.strip()
+        if content.startswith("[citation:"):
+            content = content.split("\n", 1)[-1].strip()
         if len(content) > max_content_length:
             content = content[:max_content_length] + "..."
         

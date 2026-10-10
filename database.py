@@ -166,6 +166,30 @@ def login_user(username: str, password: str) -> Dict[str, Any]:
         conn.close()
 
 
+def change_password(username: str, old_password: str, new_password: str) -> Dict[str, Any]:
+    """先核对旧密码，再更新同一套 SHA-256。"""
+    if not new_password or len(new_password) < 6:
+        return {"success": False, "message": "新密码至少 6 位"}
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "SELECT id, password_hash FROM users WHERE username = ?",
+            (username,),
+        )
+        user = cursor.fetchone()
+        if not user or user["password_hash"] != hash_password(old_password):
+            return {"success": False, "message": "旧密码不正确"}
+        cursor.execute(
+            "UPDATE users SET password_hash = ? WHERE id = ?",
+            (hash_password(new_password), user["id"]),
+        )
+        conn.commit()
+        return {"success": True, "user_id": user["id"], "username": username, "message": "密码已更新"}
+    finally:
+        conn.close()
+
+
 def get_user_by_id(user_id: int) -> Optional[Dict[str, Any]]:
     """根据ID获取用户"""
     conn = get_connection()
@@ -265,6 +289,32 @@ def get_user_conversations(user_id: int, limit: int = 50) -> List[Dict[str, Any]
             })
         
         return conversations
+    finally:
+        conn.close()
+
+
+def get_conversation_id(user_id: int, session_id: str) -> Optional[int]:
+    """按登录用户和会话找到对话主键，供长期记忆关联。"""
+    if not user_id or not session_id:
+        return None
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT id FROM conversations WHERE user_id = ? AND session_id = ? ORDER BY id DESC LIMIT 1",
+            (user_id, session_id),
+        ).fetchone()
+        return int(row["id"]) if row else None
+    finally:
+        conn.close()
+
+
+def conversation_owner(conversation_id: int) -> Optional[int]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT user_id FROM conversations WHERE id = ?", (conversation_id,))
+        row = cursor.fetchone()
+        return int(row["user_id"]) if row else None
     finally:
         conn.close()
 
