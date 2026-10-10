@@ -160,7 +160,7 @@ npm run dev
   title        = {灯灯：面向洛克王国对战辅助的结构化检索与口吻蒸馏原型},
   author       = {Dengdeng AI contributors},
   year         = {2026},
-  howpublished = {\url{https://github.com/SongHem-1/Policy-qa}},
+  howpublished = {\url{https://github.com/569838281-a11y/dengdeng_ai}},
   note         = {非官方研究原型。游戏名称与素材版权归原权利人。}
 }
 ```
