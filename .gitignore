@@ -103,3 +103,19 @@ Thumbs.db
 # Test outputs
 test_results/
 eval_results/
+
+# Local browser dumps / scratch
+.playwright-mcp/
+docs/_tmp*
+
+# Large research / eval dumps (regenerate locally)
+data/ab_segment/
+data/*_eval.txt
+data/*_bench.txt
+data/read_audit.jsonl
+data/web_retrieve_print.txt
+scripts/ab_*.py
+
+# Portfolio / career pack stays local (not part of runtime repo)
+docs/career/
+docs/_portfolio_pdf.mjs

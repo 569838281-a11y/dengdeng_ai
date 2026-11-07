@@ -48,8 +48,7 @@ def resolve_photo(name: str, form: str = "base"):
         found = _safe_png(f"{stem}.png")
         if found:
             return found, "fallback" if form == "boss" else "stem"
-    catalog = {mon["name"] for mon in load_pokemon()}
-    if cleaned not in catalog and stem not in catalog:
+    if cleaned not in {"dengdeng", "dengdeng_crying", "dengdeng_thinking"}:
         stand = _safe_png("dengdeng.png")
         if stand:
             return stand, "stand-in"

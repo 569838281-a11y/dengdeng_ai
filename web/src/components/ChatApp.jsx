@@ -14,14 +14,46 @@ const modes = [
 ];
 const storageKey = "roco-guest-chats";
 
-const thinkingLines = [
-  "灯灯记得好像在书中看到过这个知识点呀，让灯灯来好好想一想...",
-  "噔噔！让冰雪聪明的灯灯来帮你出个主意吧！",
-  "噔噔，噔噔，噔噔！灵感到底在哪里呀！",
-];
-
 function thinkingLine() {
-  return thinkingLines[Math.floor(Math.random() * thinkingLines.length)];
+  return "灯灯在听这句话。";
+}
+
+function formatTeam(team) {
+  const lines = ["队伍配置为"];
+  for (const member of team.members || []) {
+    const tags = (member.tags || []).join("、");
+    const skills = (member.skills || []).map((skill) => skill.raw || skill.name).filter(Boolean).join("、");
+    lines.push(`- ${member.name}｜标签：${tags || "未提供"}｜血脉：${member.blood || "初始血脉"}｜技能：${skills}`);
+  }
+  lines.push(`战斗道具：【${team.item || "未提供"}】`);
+  lines.push(`选取的理由是${team.reason || "按你拖过的这一套"}`);
+  return lines.join("\n");
+}
+
+function lineupLead(text) {
+  const body = String(text || "").trim();
+  const marked = body.match(/灯灯(?:记下了|改好了)第\s*\d+\s*套出场。/);
+  if (marked) return marked[0];
+  const end = body.indexOf("。");
+  if (end > 0 && end < 48) return body.slice(0, end + 1);
+  return body;
+}
+
+function lineupRecord(answer, team, sources) {
+  const lines = ["队伍配置为"];
+  for (const member of team.members || []) {
+    const tags = (member.tags || []).join("、");
+    const skills = (member.skills || []).map((skill) => skill.raw || skill.name).filter(Boolean).join("、");
+    lines.push(`- ${member.name}｜标签：${tags}｜血脉：${member.blood || ""}｜技能：${skills}`);
+  }
+  if (team.item) lines.push(`战斗道具：【${team.item}】`);
+  if (team.reason) lines.push(`选取的理由是${team.reason}`);
+  const blocks = [lineupLead(answer), lines.join("\n")];
+  const sourceLines = (sources || [])
+    .filter((item) => /^https?:\/\//i.test(item?.url || ""))
+    .map((item) => `${item.title || item.url}｜${item.url}`);
+  if (sourceLines.length) blocks.push(["来源", ...sourceLines].join("\n"));
+  return blocks.filter(Boolean).join("\n\n");
 }
 
 export function ChatApp({ auth, onLeave, onEnter }) {
@@ -58,6 +90,37 @@ export function ChatApp({ auth, onLeave, onEnter }) {
       cancel = true;
     };
   }, [auth.kind, auth.userId]);
+
+  useEffect(() => {
+    if (!sessionId) return;
+    let cancel = false;
+    api(`/files/pending?session_id=${encodeURIComponent(sessionId)}`)
+      .then((rows) => {
+        if (cancel || !Array.isArray(rows) || !rows.length) return;
+        setMessages((current) => {
+          const seen = new Set(current.map((item) => item.pending?.token).filter(Boolean));
+          const extra = rows
+            .filter((item) => item?.token && !seen.has(item.token))
+            .map((item) => ({
+              id: `pending-${item.token}`,
+              role: "assistant",
+              text: item.preview || "灯灯等你点头。",
+              mood: "normal",
+              pending: item,
+              team: parseTeam(item.roster),
+              trace: [
+                { kind: "edit", text: item.preview || item.label || "等你点头" },
+                { kind: "thought", text: `待确认 ${item.token}` },
+              ],
+            }));
+          return extra.length ? [...current, ...extra] : current;
+        });
+      })
+      .catch(() => {});
+    return () => {
+      cancel = true;
+    };
+  }, [sessionId]);
 
   useEffect(() => {
     if (auth.kind !== "guest" || !activeId) return;
@@ -192,19 +255,79 @@ export function ChatApp({ auth, onLeave, onEnter }) {
       inflightRef.current.jobIds = [...(inflightRef.current.jobIds || []), job.job_id];
     }
     const withNote = (trace) => (note ? [{ kind: "thought", text: note }, ...(trace || [])] : trace);
+    const source = new EventSource(`/api/v1/jobs/${job.job_id}/events`);
+    source.onmessage = (event) => {
+      if (runRef.current !== run) return;
+      let data;
+      try {
+        data = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+      if (!data || data.kind === "ping" || data.kind === "status") {
+        if (data?.kind === "status" && ["done", "error", "superseded", "awaiting_confirm"].includes(data.status)) source.close();
+        return;
+      }
+      setMessages((rows) => rows.map((row) => {
+        if (row.id !== bubbleId) return row;
+        const trace = [...(row.trace || [])];
+        if (data.kind === "delta") {
+          const last = trace[trace.length - 1];
+          if (last && last.kind === "thought" && last.open) trace[trace.length - 1] = { ...last, text: data.text };
+          else trace.push({ kind: "thought", text: data.text, open: true });
+          return { ...row, trace, mood: "thinking" };
+        }
+        if (data.kind === "close") {
+          const last = trace[trace.length - 1];
+          if (last?.open) trace[trace.length - 1] = { ...last, open: false };
+          return { ...row, trace, mood: "thinking" };
+        }
+        if (trace.some((item) => item.kind === data.kind && item.text === data.text)) return row;
+        return { ...row, trace: [...trace, { kind: data.kind, text: data.text }], mood: row.mood === "normal" ? row.mood : "thinking" };
+      }));
+    };
+    source.onerror = () => source.close();
     if (runRef.current === run) patchById(bubbleId, { trace: withNote(job.trace), mood: "thinking" });
     let view = job;
-    const deadline = Date.now() + (kind === "search" ? 180000 : 600000);
-    while (runRef.current === run && Date.now() < deadline && !["done", "error", "superseded"].includes(view.status)) {
+    // 多跳联网（出场率桥接 + 名录 + 成文）常超过 3 分钟；超时只表示前端等不及，后台可能仍在跑。
+    const deadline = Date.now() + (kind === "search" ? 360000 : 600000);
+    const finished = ["done", "error", "superseded", "awaiting_confirm"];
+    while (runRef.current === run && Date.now() < deadline && !finished.includes(view.status)) {
       await new Promise((resolve) => setTimeout(resolve, 400));
-      if (runRef.current !== run) return null;
+      if (runRef.current !== run) {
+        source.close();
+        return null;
+      }
       view = await api(`${path}/${job.job_id}`, { timeoutMs: 8000 });
-      if (runRef.current !== run) return null;
-      if (view.trace) patchById(bubbleId, { trace: withNote(view.trace), mood: "thinking" });
+      if (runRef.current !== run) {
+        source.close();
+        return null;
+      }
+      if (view.trace) {
+        setMessages((rows) => rows.map((row) => {
+          if (row.id !== bubbleId) return row;
+          const server = withNote(view.trace);
+          const local = row.trace || [];
+          const serverTail = server[server.length - 1]?.text?.length || 0;
+          const localTail = local[local.length - 1]?.text?.length || 0;
+          const newer = server.length > local.length || (server.length === local.length && serverTail >= localTail);
+          return { ...row, trace: newer ? server : local, mood: "thinking" };
+        }));
+      }
     }
+    source.close();
     if (runRef.current !== run || !view || view.status === "superseded") return null;
     if (view.status === "error" || view.error) {
       patchById(bubbleId, { text: `❌ ${view.error || view.message || "失败"}`, trace: view.trace, mood: "cry" });
+    } else if (view.status === "awaiting_confirm" || view.pending_write) {
+      const pending = view.pending_write || null;
+      patchById(bubbleId, {
+        text: pending?.preview || view.answer || "灯灯等你点头。",
+        trace: withNote(view.trace),
+        pending,
+        team: view.team || parseTeam(view.roster) || parseTeam(pending?.roster),
+        mood: "normal",
+      });
     } else if (view.status !== "done") {
       const timeoutText = kind === "search" ? "❌ 检索超时：任务仍在处理，请稍后重试" : "❌ 配队超时：任务仍在处理，请稍后重试";
       patchById(bubbleId, { text: timeoutText, trace: view.trace, mood: "cry" });
@@ -230,15 +353,60 @@ export function ChatApp({ auth, onLeave, onEnter }) {
       });
     } else {
       const answer = view.answer || "";
+      const team = view.team || parseTeam(view.answer) || parseTeam(view.roster);
+      const webSources = view.web_sources || [];
       patchById(bubbleId, {
         text: answer,
         trace: withNote(view.trace),
-        team: view.team || parseTeam(view.answer),
+        team,
+        webSources,
         mood: String(answer).trim() ? "normal" : "cry",
       });
+      if (team) {
+        await remember(chatId, "assistant", lineupRecord(answer, team, webSources));
+        return view;
+      }
     }
     await remember(chatId, "assistant", view.answer || view.error || view.message || "");
     return view;
+  }
+
+  async function reviseTeam(message, team) {
+    const corrected = formatTeam(team);
+    const result = await api("/teams/revise", {
+      method: "POST",
+      timeoutMs: 20000,
+      body: JSON.stringify({
+        question: message.question || "",
+        model_answer: message.text || corrected,
+        corrected_team: corrected,
+      }),
+    });
+    return result;
+  }
+
+  function settleWrite(token, text, roster) {
+    const team = parseTeam(roster);
+    setMessages((rows) => [
+      ...rows.map((row) => (row.pending?.token === token ? { ...row, pending: null } : row)),
+      { role: "assistant", text, team, mood: "normal" },
+    ]);
+  }
+
+  async function confirmWrite(token) {
+    const result = await api("/files/confirm", {
+      method: "POST",
+      body: JSON.stringify({ token }),
+    });
+    settleWrite(token, result.text || `灯灯记下了${result.saved || ""}。`, result.roster);
+  }
+
+  async function rejectWrite(token) {
+    const result = await api("/files/reject", {
+      method: "POST",
+      body: JSON.stringify({ token }),
+    });
+    settleWrite(token, result.text || "灯灯没有记下。", "");
   }
 
   async function send(event) {
@@ -274,6 +442,7 @@ export function ChatApp({ auth, onLeave, onEnter }) {
           id: `pending-${run}-${index}`,
           role: "assistant",
           text: thinkingLine(),
+          question: text,
           team: null,
           mood: "thinking",
           trace: [{ kind: "thought", text: index === 0 ? note : "灯灯再答后一项" }],
@@ -311,7 +480,7 @@ export function ChatApp({ auth, onLeave, onEnter }) {
     const bubbleId = `pending-${run}`;
     setBusy(true);
     inflightRef.current = { run, question: text, jobIds: [], mode, sid: sessionId };
-    setMessages((rows) => [...rows, { role: "user", text }, { id: bubbleId, role: "assistant", text: thinkingLine(), team: null, mood: "thinking" }]);
+    setMessages((rows) => [...rows, { role: "user", text }, { id: bubbleId, role: "assistant", text: thinkingLine(), question: text, team: null, mood: "thinking" }]);
     try {
       const chat = await ensureServerChat(text.slice(0, 18));
       if (runRef.current !== run) return;
@@ -440,7 +609,14 @@ export function ChatApp({ auth, onLeave, onEnter }) {
             </div>
           ) : null}
           {messages.map((item, index) => (
-            <ChatBubble key={item.id || index} message={item} onTrialFinish={finishTrial} />
+            <ChatBubble
+              key={item.id || index}
+              message={item}
+              onTrialFinish={finishTrial}
+              onRevise={reviseTeam}
+              onConfirmWrite={confirmWrite}
+              onRejectWrite={rejectWrite}
+            />
           ))}
           {mode === "battle" ? (
             <BattleBox

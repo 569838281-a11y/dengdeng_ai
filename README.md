@@ -110,7 +110,7 @@ npm run dev
 | `TEAM_USE_VECTOR` | `false` | 为 true 时配队才尝试向量库 |
 | `USE_LORA_REPLIER` | `false` | 为 true 且适配器存在时，配队与检索先走 LoRA |
 | `WEB_SEARCH_API_KEY` | 空 | 检索模式的联网。引擎默认 Tavily |
-| `WEB_SEARCH_ENGINE` | `tavily` | `tavily`、`bing` 或 `bravesearch` |
+| `WEB_SEARCH_ENGINE` | `tavily` | `tavily`、`bing`、`bravesearch` 或 `deepseek`（deepseek 用 `DEEPSEEK_API_KEY`） |
 | `REDIS_URL` | `redis://localhost:16379/0` | 不可用时自动改用磁盘 |
 | `SESSION_TTL` | 3600 | 会话保留秒数 |
 

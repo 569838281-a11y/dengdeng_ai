@@ -325,6 +325,21 @@ class TeamFeedbackRequest(BaseModel):
     accepted: bool = Field(..., description="用户是否采纳")
     corrected_team: str = Field(default="", description="用户改过的队伍，作为 DPO 的优选答案")
 
+class TeamReviseRequest(BaseModel):
+    question: str = Field(default="", description="原来的配队要求")
+    model_answer: str = Field(default="", description="模型给出的队伍")
+    corrected_team: str = Field(..., min_length=1, description="用户拖改后的队伍")
+
+class FileConfirmRequest(BaseModel):
+    token: str = Field(..., min_length=4, description="待确认写入的记号")
+
+class KnowledgeProposeRequest(BaseModel):
+    path: str = Field(..., description="knowledge/rules.md 或 knowledge/pokemon/某只.json")
+    text: str = Field(default="", description="确认前的新正文")
+
+class KnowledgeTokenRequest(BaseModel):
+    token: str = Field(..., min_length=4)
+
 class HealthResponse(BaseModel):
     status: str = Field(..., description="服务状态")
     chain_ready: bool = Field(..., description="问答链是否就绪")
@@ -718,7 +733,7 @@ def _team_cards(job: dict):
     ):
         question = ""
     issues = [
-        issue for issue in validate_team_answer(answer, question)
+        issue for issue in validate_team_answer(answer, question, job.get("session_id") or "")
         if issue and not contains_banned(issue)
     ]
     return {
@@ -729,25 +744,70 @@ def _team_cards(job: dict):
     }
 
 
-def _clean_trace(text: str) -> str:
+def _clean_trace(text: str, limit: int = 96) -> str:
     raw = str(text or "")
+    links = re.findall(r"https?://[^\s）]+", raw)
+    for index, link in enumerate(links):
+        raw = raw.replace(link, f"\u0000{index}\u0000", 1)
     raw = re.sub(r"（boss=[^）]*）", "", raw)
     raw = re.sub(r"\.json", "", raw, flags=re.IGNORECASE)
     for word in ("文件", "写入", "配置", "调用", "接口", "函数", "代码", "数据库"):
         raw = raw.replace(word, "")
     raw = re.sub(r"json|mcp|api|pdf|csv|word", "", raw, flags=re.IGNORECASE)
+    for index, link in enumerate(links):
+        raw = raw.replace(f"\u0000{index}\u0000", link, 1)
     raw = re.sub(r"\s+", " ", raw).strip(" ，。；")
-    return raw[:96]
+    if links:
+        return raw[:240]
+    return raw[:limit]
 
 
 def _append_job_trace(job: dict, kind: str, text: str) -> None:
+    from agents.live_feed import publish
+
+    job_id = job.get("job_id") or ""
+    rows = job.setdefault("trace", [])
+    if kind == "close":
+        if rows and rows[-1].get("open"):
+            rows[-1]["open"] = False
+        publish(job_id, {"kind": "close"})
+        return
+    if kind == "delta":
+        shown = _clean_trace(text, 160)
+        if not shown:
+            return
+        if not rows or not rows[-1].get("open"):
+            rows.append({"kind": "thought", "text": "", "open": True})
+        if rows[-1].get("text") == shown:
+            return
+        rows[-1]["text"] = shown
+        publish(job_id, {"kind": "delta", "text": shown})
+        return
     cleaned = _clean_trace(text)
     if not cleaned:
         return
-    rows = job.setdefault("trace", [])
     if rows and rows[-1].get("kind") == kind and rows[-1].get("text") == cleaned:
         return
     rows.append({"kind": kind, "text": cleaned})
+    publish(job_id, {"kind": kind, "text": cleaned})
+
+
+def _emit_job_status(store: dict, lock: threading.Lock, job_id: str) -> None:
+    with lock:
+        job = store.get(job_id)
+        status = (job or {}).get("status") or "error"
+    from agents.live_feed import publish
+
+    publish(job_id, {"kind": "status", "status": status})
+
+
+def _find_job(job_id: str) -> dict:
+    with _AGENT_JOBS_LOCK:
+        job = _AGENT_JOBS.get(job_id)
+    if job:
+        return job
+    with _KNOWLEDGE_JOBS_LOCK:
+        return _KNOWLEDGE_JOBS.get(job_id) or {}
 
 
 def _bind_job_thoughts(store: dict, lock: threading.Lock, job_id: str):
@@ -765,31 +825,31 @@ def _bind_job_thoughts(store: dict, lock: threading.Lock, job_id: str):
 def _knowledge_trace(step_id: str, status: str, detail: str) -> tuple:
     detail = _clean_trace(detail)
     if step_id == "parse" and status == "running":
-        return "thought", "灯灯先把这句话拆开"
+        return "", ""
     if step_id == "parse" and status == "done":
-        return "thought", detail or "问句已经拆开"
+        return "thought", detail or ""
     if step_id == "lookup" and status == "running":
-        return "thought", "灯灯去名录和板块里翻"
+        return "", ""
     if step_id == "lookup" and status == "done":
-        return "read", detail or "名录"
+        return "read", detail or ""
     if step_id == "web" and status == "running":
-        return "thought", "本地没有的，灯灯到外面看一眼"
+        return "thought", "名录里没有这一处，灯灯到外面看"
     if step_id == "web" and status == "done":
-        return "read", detail or "外面的说法"
-    if step_id == "web" and status == "skip" and "未开启" in detail:
-        return "thought", "灯灯这次不到外面看"
+        return "read", detail or "外面的这一页"
     if step_id == "web" and status == "skip" and "百科已经有了" in detail:
-        return "thought", "灯灯在百科里翻到了，不到外面看"
+        return "thought", "名录里翻到了，灯灯不到外面看"
     if step_id == "web" and status == "skip" and "这段对话里已经有了" in detail:
         return "thought", "灯灯翻的是这段对话里记下的"
+    if step_id == "web" and status == "skip" and detail:
+        return "thought", "这一问先用名录里的，灯灯不到外面看"
     if step_id == "retrieve" and status == "done":
-        return "read", detail or "召回的片段"
+        return "read", detail or ""
     if step_id == "generate" and status == "running":
-        return "thought", "灯灯把翻到的讲给小洛克"
+        return "", ""
     if step_id == "generate" and status == "done":
-        return "thought", detail or "灯灯讲完了"
+        return "thought", detail or "灯灯按刚翻到的这些讲"
     if step_id == "done" and status == "done":
-        return "thought", "灯灯把结果收好了"
+        return "", ""
     return "", ""
 
 
@@ -803,12 +863,14 @@ def _agent_job_view(job: dict) -> dict:
         "message": job.get("message", ""),
         "answer": job.get("answer", ""),
         "sources": job.get("sources") or [],
+        "web_sources": job.get("web_sources") or [],
         "passed_check": bool(job.get("passed_check")),
         "llm_calls": int(job.get("llm_calls") or 0),
         "error": job.get("error", ""),
         "team": _team_cards(job),
         "trial": job.get("trial"),
         "trace": list(job.get("trace") or []),
+        "pending_write": job.get("pending_write"),
     }
 
 
@@ -842,11 +904,19 @@ def _execute_team(req: QueryRequest, on_progress=None, cancel=None):
     if not catalog_ready():
         raise HTTPException(status_code=503, detail="还没有精灵资料。请把 JSON 放进 knowledge/pokemon/。")
 
+    history = []
+    if req.session_id:
+        try:
+            history = session_store.get(req.session_id) or []
+        except Exception:
+            history = []
     return run_collaborative_agents(
         req.question,
         on_progress=on_progress,
         session_id=req.session_id or "",
         cancel=cancel,
+        user_id=str(req.user_id or ""),
+        history=history,
     )
 
 
@@ -855,10 +925,6 @@ def _run_agent_job(job_id: str, req: QueryRequest) -> None:
     pending_done = {"message": "配队完成"}
 
     def on_progress(step: str, message: str) -> None:
-        with _AGENT_JOBS_LOCK:
-            job = _AGENT_JOBS.get(job_id)
-            if job and job.get("status") != "error":
-                _append_job_trace(job, "thought", message)
         if step == "done":
             pending_done["message"] = message
             return
@@ -873,11 +939,18 @@ def _run_agent_job(job_id: str, req: QueryRequest) -> None:
 
     try:
         from agents.thoughts import reset
+        from agents.write_confirm import arm, disarm
 
         token = _bind_job_thoughts(_AGENT_JOBS, _AGENT_JOBS_LOCK, job_id)
+        from agents.react_stream import bind_thinker, model_thinker, reset_thinker
+
+        thinker_token = bind_thinker(model_thinker())
+        held = arm(req.session_id or "", job_id)
         try:
             trace = _execute_team(req, on_progress, cancel=lambda: _job_cancelled(_AGENT_JOBS, _AGENT_JOBS_LOCK, job_id))
         finally:
+            disarm(held)
+            reset_thinker(thinker_token)
             reset(token)
         if _job_cancelled(_AGENT_JOBS, _AGENT_JOBS_LOCK, job_id):
             with _AGENT_JOBS_LOCK:
@@ -897,13 +970,18 @@ def _run_agent_job(job_id: str, req: QueryRequest) -> None:
             job["roster"] = trace.get("roster") or ""
             job["trial"] = trace.get("trial")
             job["sources"] = sources
+            job["web_sources"] = trace.get("web_sources") or []
             job["passed_check"] = bool(trace.get("passed"))
             job["llm_calls"] = int(trace.get("llm_calls") or 0)
             job["step"] = "done"
             job["step_index"] = 6
             job["message"] = pending_done["message"]
-            job["status"] = "done"
             job["error"] = ""
+            pending = trace.get("pending_write") or None
+            job["pending_write"] = pending
+            if not job.get("roster") and pending and pending.get("roster"):
+                job["roster"] = pending.get("roster") or ""
+            job["status"] = "awaiting_confirm" if pending else "done"
     except TimeoutError:
         with _AGENT_JOBS_LOCK:
             job = _AGENT_JOBS.get(job_id)
@@ -923,6 +1001,8 @@ def _run_agent_job(job_id: str, req: QueryRequest) -> None:
                 return
             job["status"] = "error"
             job["error"] = text
+    finally:
+        _emit_job_status(_AGENT_JOBS, _AGENT_JOBS_LOCK, job_id)
 
 
 @app.post("/api/v1/agents/query", response_model=AgentQueryResponse, tags=["问答"])
@@ -1002,12 +1082,14 @@ async def create_agent_job(req: QueryRequest):
         "message": "正在检索精灵名录和规则…",
         "answer": "",
         "sources": [],
+        "web_sources": [],
         "passed_check": False,
         "llm_calls": 0,
         "error": "",
-        "trace": [{"kind": "thought", "text": "灯灯开始想"}],
+        "trace": [],
         "created_at": time.time(),
         "question": req.question,
+        "session_id": req.session_id or "",
         "cancel": threading.Event(),
     }
     with _AGENT_JOBS_LOCK:
@@ -1038,6 +1120,135 @@ async def team_feedback(req: TeamFeedbackRequest):
     """记录采纳、拒绝和用户改写。有对比时写成 DPO 偏好对。"""
     from pokemon_kb import record_feedback
     return record_feedback(req.question, req.model_answer, req.accepted, req.corrected_team)
+
+
+@app.post("/api/v1/teams/revise", tags=["配队学习"])
+async def revise_team(req: TeamReviseRequest):
+    """核对用户拖改后的队伍。通过才写成偏好，不通过只返回缺口。"""
+    from pokemon_kb import record_feedback, validate_team_answer
+
+    issues = validate_team_answer(req.corrected_team, req.question)
+    if issues:
+        return {"saved": False, "issues": issues, "team": req.corrected_team}
+    saved = record_feedback(
+        req.question,
+        req.model_answer or req.corrected_team,
+        False,
+        req.corrected_team,
+    )
+    return {"saved": True, "issues": [], "team": req.corrected_team, "pairs": saved.get("pairs", 0)}
+
+
+@app.get("/api/v1/files/pending", tags=["文档"])
+async def list_file_writes(session_id: str = ""):
+    """刷新后仍能看见还没点头的仓库、出场和文档。"""
+    from agents.write_confirm import list_pending
+    from agents.write_gate import list_pending as list_documents
+
+    return list_pending(session_id) + list_documents(session_id)
+
+
+@app.post("/api/v1/files/confirm", tags=["文档"])
+async def confirm_file_write(req: FileConfirmRequest):
+    """人看过预览之后，才把仓库、出场或文档落盘。"""
+    from agents.write_confirm import commit as commit_table
+    from agents.write_gate import commit
+
+    from agents.write_confirm import _load
+
+    payload, _path = _load(req.token)
+    if payload and payload.get("thread_id"):
+        from agents.cycle_graph import resume_held
+
+        book = resume_held(payload["thread_id"], True)
+        speech = book.get("speech") or ""
+        if "没接上" not in speech:
+            return {
+                "saved": (payload.get("label") or "仓库"),
+                "text": speech or "灯灯记下了。",
+                "roster": book.get("roster_text") or payload.get("roster") or "",
+            }
+    try:
+        return commit_table(req.token)
+    except FileNotFoundError:
+        pass
+    try:
+        name = commit(req.token)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="没有这份待确认的内容") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="这份内容不能写入") from exc
+    return {"saved": name, "text": f"灯灯记下了{Path(name).stem}。"}
+
+
+@app.post("/api/v1/files/reject", tags=["文档"])
+async def reject_file_write(req: FileConfirmRequest):
+    """人拒绝后，待确认单删掉，仓库和出场保持原样。"""
+    from agents.write_confirm import reject as reject_table
+    from agents.write_gate import reject as reject_document
+
+    from agents.write_confirm import _load
+
+    payload, _path = _load(req.token)
+    if payload and payload.get("thread_id"):
+        from agents.cycle_graph import resume_held
+
+        book = resume_held(payload["thread_id"], False)
+        speech = book.get("speech") or ""
+        if "没接上" not in speech:
+            return {"text": speech or "灯灯没有记下。"}
+    try:
+        return reject_table(req.token)
+    except FileNotFoundError:
+        pass
+    try:
+        reject_document(req.token)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="没有这份待确认的内容") from exc
+    return {"text": "灯灯没有记下。"}
+
+
+@app.post("/api/v1/knowledge/propose", tags=["知识库"])
+async def propose_knowledge(req: KnowledgeProposeRequest):
+    """只生成差异，不改名录和规则。"""
+    from pathlib import Path
+
+    from agents.knowledge_revision import propose
+
+    try:
+        return propose(Path(__file__).resolve().parent, req.path, req.text)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="只能提议规则或某一只精灵的记录") from exc
+
+
+@app.post("/api/v1/knowledge/confirm", tags=["知识库"])
+async def confirm_knowledge(req: KnowledgeTokenRequest):
+    """确认后先留快照，再写入，并记一条日志。"""
+    from pathlib import Path
+
+    from agents.knowledge_revision import confirm
+
+    try:
+        return confirm(Path(__file__).resolve().parent, req.token)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="没有这份待确认的更新") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="这份更新不能写入") from exc
+
+
+@app.post("/api/v1/knowledge/rollback", tags=["知识库"])
+async def rollback_knowledge(req: KnowledgeTokenRequest):
+    """用当时的快照写回原知识库。"""
+    from pathlib import Path
+
+    from agents.knowledge_revision import rollback
+
+    try:
+        return rollback(Path(__file__).resolve().parent, req.token)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="没有可退回的快照") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="这份记录不能退回") from exc
 
 
 @app.post("/api/v1/skills/export", tags=["技能蒸馏"])
@@ -1389,7 +1600,7 @@ def _report_knowledge_step(job_id: str, step_id: str, status: str, detail: str, 
             _append_job_trace(job, kind, line)
 
 
-def _run_knowledge_job(job_id: str, question: str, use_web: bool = False, session_id: str = "") -> None:
+def _run_knowledge_job(job_id: str, question: str, use_web: bool = False, session_id: str = "", user_id=None) -> None:
     from knowledge_search import run_knowledge_search
 
     time.sleep(0.15)
@@ -1401,9 +1612,42 @@ def _run_knowledge_job(job_id: str, question: str, use_web: bool = False, sessio
         from agents.thoughts import reset
 
         token = _bind_job_thoughts(_KNOWLEDGE_JOBS, _KNOWLEDGE_JOBS_LOCK, job_id)
+        from agents.react_stream import bind_thinker, model_thinker, reset_thinker
+
+        thinker_token = bind_thinker(model_thinker())
+        from agents.kv_blocks import bind_model_context, blocks_from_traces, clear_model_context
+        from agents.pipeline import TRACE_DIR
+
         try:
-            result = run_knowledge_search(question, report, use_web=bool(use_web), session_id=session_id)
+            history = []
+            if session_id:
+                try:
+                    history = session_store.get(session_id) or []
+                except Exception:
+                    history = []
+            from agents.fact_memory import absorb_history, fact_blocks
+            from agents.work_cycle import context_blocks, prepare_turn
+
+            absorb_history(session_id, history)
+            prepared = prepare_turn(question, history, user_id)
+            bind_model_context(
+                question,
+                history,
+                blocks_from_traces(session_id, TRACE_DIR),
+                extra=fact_blocks(session_id, question) + context_blocks(prepared),
+            )
+            result = run_knowledge_search(
+                question,
+                report,
+                use_web=bool(use_web),
+                session_id=session_id,
+                history=history,
+                user_id=str(user_id or ""),
+                prepared=prepared,
+            )
         finally:
+            clear_model_context()
+            reset_thinker(thinker_token)
             reset(token)
         if _job_cancelled(_KNOWLEDGE_JOBS, _KNOWLEDGE_JOBS_LOCK, job_id):
             with _KNOWLEDGE_JOBS_LOCK:
@@ -1424,6 +1668,11 @@ def _run_knowledge_job(job_id: str, question: str, use_web: bool = False, sessio
             job["status"] = "done"
             job["error"] = ""
             job["message"] = "检索完成"
+            answer_text = job["answer"]
+        if session_id:
+            from agents.turn_memory import remember_exchange
+
+            remember_exchange(session_id, question, answer_text)
     except Exception as exc:
         logger.error(f"检索任务失败: {exc}")
         with _KNOWLEDGE_JOBS_LOCK:
@@ -1438,6 +1687,75 @@ def _run_knowledge_job(job_id: str, question: str, use_web: bool = False, sessio
                     step["status"] = "error"
                     step["detail"] = step.get("detail") or "这一步失败了"
                     break
+    finally:
+        _emit_job_status(_KNOWLEDGE_JOBS, _KNOWLEDGE_JOBS_LOCK, job_id)
+
+
+@app.get("/api/v1/jobs/{job_id}/events", tags=["问答"])
+async def job_events(job_id: str):
+    """把 Thought、Read、Edited 按发生顺序推给页面。页面仍可轮询同一份记录。"""
+    import queue as queue_mod
+
+    from fastapi.responses import StreamingResponse
+
+    from agents.live_feed import subscribe, unsubscribe
+
+    feed = subscribe(job_id)
+    job = _find_job(job_id)
+    if not job:
+        unsubscribe(job_id, feed)
+        raise HTTPException(status_code=404, detail="找不到这项任务")
+    backlog = list(job.get("trace") or [])
+    terminal = {"done", "error", "superseded", "awaiting_confirm"}
+
+    async def stream():
+        seen = set()
+
+        def one(item: dict):
+            key = (item.get("kind"), item.get("text"), item.get("status"))
+            if key in seen:
+                return ""
+            seen.add(key)
+            return _sse(item)
+
+        try:
+            for item in backlog:
+                chunk = one(item)
+                if chunk:
+                    yield chunk
+            status = (_find_job(job_id) or {}).get("status") or ""
+            if status in terminal:
+                yield _sse({"kind": "status", "status": status})
+                return
+            while True:
+                item = await asyncio.to_thread(_next_event, feed, queue_mod)
+                if item.get("kind") == "ping":
+                    yield ": keepalive\n\n"
+                    continue
+                chunk = one(item)
+                if chunk:
+                    yield chunk
+                if item.get("kind") == "status" and item.get("status") in terminal:
+                    return
+        finally:
+            unsubscribe(job_id, feed)
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+def _sse(payload: dict) -> str:
+    return "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+
+
+def _next_event(feed, queue_mod):
+    try:
+        return feed.get(timeout=12)
+    except queue_mod.Empty:
+        return {"kind": "ping"}
 
 
 @app.post("/api/v1/knowledge/jobs", tags=["检索"])
@@ -1461,7 +1779,7 @@ async def create_knowledge_job(req: QueryRequest):
         "trial": None,
         "steps": steps,
         "error": "",
-        "trace": [{"kind": "thought", "text": "灯灯开始想"}],
+        "trace": [],
         "created_at": time.time(),
         "question": req.question,
         "cancel": threading.Event(),
@@ -1474,7 +1792,7 @@ async def create_knowledge_job(req: QueryRequest):
         await asyncio.sleep(0.05)
         threading.Thread(
             target=_run_knowledge_job,
-            args=(job_id, req.question, bool(req.use_web), req.session_id or ""),
+            args=(job_id, req.question, bool(req.use_web), req.session_id or "", req.user_id),
             daemon=True,
         ).start()
 

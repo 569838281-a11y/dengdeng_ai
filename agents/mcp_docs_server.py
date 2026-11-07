@@ -1,6 +1,7 @@
 """文档 MCP Server。只通过 stdio 提供表格和文档工具，不提供 JSON 名册工具。"""
 import csv
 import io
+import json
 import logging
 import os
 import sys
@@ -49,6 +50,28 @@ def _relative(path: str) -> Path:
     return rel
 
 
+_PRIVATE_PARTS = ("env", "secret", "credential", "password", "session", "memory")
+
+
+def _audit_read(target: Path) -> None:
+    folder = _workspace() / "data"
+    folder.mkdir(parents=True, exist_ok=True)
+    line = json.dumps({
+        "path": target.name,
+        "suffix": target.suffix.lower(),
+    }, ensure_ascii=False)
+    with (folder / "read_audit.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(line + "\n")
+
+
+def _refuse_private(target: Path) -> None:
+    name = target.name.lower()
+    if target.suffix.lower() in {".db", ".sqlite", ".pem", ".key"} or name.startswith(".env"):
+        raise PermissionError("private")
+    if any(part in name for part in _PRIVATE_PARTS):
+        raise PermissionError("private")
+
+
 def _find_read(path: str, suffixes: set) -> Path:
     rel = _relative(path)
     if rel.suffix.lower() not in suffixes:
@@ -58,6 +81,8 @@ def _find_read(path: str, suffixes: set) -> Path:
         for candidate in (root / rel, root / rel.name):
             resolved = candidate.resolve()
             if _inside(root, resolved) and resolved.is_file():
+                _refuse_private(resolved)
+                _audit_read(resolved)
                 return resolved
     raise FileNotFoundError(path)
 
@@ -184,27 +209,19 @@ def write_document(path: str, text: str, kind: str = "docx") -> str:
     filename = rel.name
     if not filename.lower().endswith("." + chosen):
         filename = f"{Path(filename).stem}.{chosen}"
-    target = _find_write(filename, _WRITE_DOC)
+    _find_write(filename, _WRITE_DOC)
     payload = (text or "").strip() or "灯灯记下了这些伙伴。"
-    if chosen == "docx":
-        from docx import Document
+    root = Path(__file__).resolve().parents[1]
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    from agents.thoughts import note_thought
+    from agents.write_confirm import current_session
+    from agents.write_gate import stage
 
-        document = Document()
-        for line in payload.splitlines() or [payload]:
-            document.add_paragraph(line)
-        document.save(str(target))
-    else:
-        import pymupdf
-
-        opened = pymupdf.open()
-        try:
-            page = opened.new_page()
-            page.insert_text((72, 72), payload[:4000], fontname="china-s", fontsize=12)
-            opened.save(str(target))
-        finally:
-            opened.close()
-    logger.info("write_document %s", target.name)
-    return f"saved: {target.name}"
+    token = stage(filename, payload, chosen, session_id=current_session())
+    note_thought(f"待确认 {token}")
+    logger.info("write_document staged %s", filename)
+    return f"待确认 {token}\n将写入{filename}：\n{payload[:800]}"
 
 
 def main() -> None:

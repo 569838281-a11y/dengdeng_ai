@@ -688,78 +688,6 @@ def _rescue_by_spoken(question: str) -> dict:
     return _finish(plan, hits, answer, [hit["title"] for hit in hits], terms)
 
 
-def _plan_by_rules(question: str) -> dict:
-    text = (question or "").strip()
-    names = [mon["name"] for mon in find_by_name(text)]
-    skills = _mentioned_skills(text)
-    types = _detect_types(text)
-    plates = _detect_plates(text)
-    plan = {
-        "intent": "unknown",
-        "types": types,
-        "names": names,
-        "skills": skills,
-        "plates": plates,
-        "queries": [],
-        "focus": "",
-        "need_rag": True,
-        "source": "rules",
-    }
-    if _DAMAGE_ASK.search(text):
-        plan["intent"] = "rules"
-        plan["focus"] = "damage"
-        plan["plates"] = ["板块 M"]
-        if re.search(r"克制|抵抗", text):
-            plan["plates"].append("板块 A")
-        plan["queries"] = ["板块 M 伤害公式 威力 攻防比 本系加成 克制倍率"]
-        plan["skills"] = []
-        return plan
-    if names and _POOL_ASK.search(text):
-        plan["intent"] = "lookup_pool"
-        plan["focus"] = "pool"
-        plan["skills"] = []
-        plan["queries"] = [f"{name} 自带 技能石 血脉" for name in names[:2]]
-        return plan
-    if skills:
-        plan["intent"] = "lookup_skill"
-        plan["focus"] = "skill"
-        plan["plates"] = ["板块 G"]
-        plan["queries"] = []
-        for name in skills[:2]:
-            plan["queries"].extend([name, f"板块 G {name}", f"哪些精灵会{name}"])
-        return plan
-    if names:
-        plan["intent"] = "lookup_one"
-        plan["skills"] = []
-        plan["queries"] = names[:2]
-        return plan
-    if "技能" in text and types:
-        plan["intent"] = "skills"
-        return plan
-    if types and any(word in text for word in ("推荐", "一只", "一个")):
-        plan["intent"] = "recommend"
-        return plan
-    if types and any(word in text for word in ("有什么", "哪些", "列出", "有哪些")):
-        plan["intent"] = "list"
-        return plan
-    if types:
-        plan["intent"] = "list"
-        return plan
-    if plates:
-        plan["intent"] = "rules"
-        plan["types"] = []
-        return plan
-    if _asks_defend_mechanic(text):
-        plan["intent"] = "mechanic_defend"
-        plan["skills"] = ["防御"]
-        return plan
-    if "打断" in text and "状态" in text and find_by_skill("截拳"):
-        plan["intent"] = "lookup_skill"
-        plan["skills"] = ["截拳"]
-        return plan
-    return plan
-
-
 def _plan_with_model(question: str) -> dict:
     """规则对不上时，让短超时模型只产出意图 JSON。失败就当没规划。"""
     from llm_provider import get_team_invoke
@@ -877,36 +805,70 @@ def _apply_model_brief(plan: dict, question: str) -> dict:
     return plan
 
 
-def plan_query(question: str, allow_model: bool = False) -> dict:
-    plan = _plan_by_rules(question)
-    if allow_model:
-        plan = _apply_model_brief(plan, question)
-        if plan["intent"] == "unknown":
-            modeled = _plan_with_model(question)
-            if modeled:
-                return modeled
+def _empty_plan(question: str) -> dict:
+    text = (question or "").strip()
+    return {
+        "intent": "unknown",
+        "types": [],
+        "names": [],
+        "skills": [],
+        "plates": [],
+        "queries": [text] if text else [],
+        "focus": "",
+        "need_rag": True,
+        "source": "model",
+    }
+
+
+def _pool_plan(question: str):
+    """点名精灵问技能时，直接读这只的三池，不把类别改到技能总表。"""
+    from agents.fact_read import skill_pool_name
+
+    name = skill_pool_name(question)
+    if not name:
+        return None
+    return {
+        "intent": "lookup_pool",
+        "types": [],
+        "names": [name],
+        "skills": [],
+        "plates": [],
+        "queries": [f"{name}的技能"],
+        "focus": "pool",
+        "need_rag": False,
+        "source": "rule",
+    }
+
+
+def plan_query(question: str, allow_model: bool = True) -> dict:
+    """检索计划交给模型。模型没给出计划时，只保留原句，不再按词决定查法。"""
+    pooled = _pool_plan(question)
+    if pooled:
+        return pooled
+    plan = _empty_plan(question)
+    if not allow_model:
+        return plan
+    plan = _apply_model_brief(plan, question)
+    if plan.get("intent") == "unknown":
+        modeled = _plan_with_model(question)
+        if modeled:
+            return modeled
     return plan
 
 
-def _parse_detail(plan: dict) -> str:
-    queries = "；".join((plan.get("queries") or [])[:2])
-    if queries:
-        return f"改写成 {queries}"
-    intent = plan.get("intent") or "unknown"
-    if plan.get("skills"):
-        return f"意图 {intent}，技能 {_type_names(plan['skills'][:3])}"
-    if plan.get("types"):
-        return f"意图 {intent}，属性 {_type_names(plan['types'])}"
-    if plan.get("names"):
-        return f"意图 {intent}，名字 {_type_names(plan['names'][:3])}"
-    if plan.get("plates"):
-        return f"意图 {intent}，{_type_names(plan['plates'])}"
-    return f"意图 {intent}"
+def _parse_detail(plan: dict, question: str = "") -> str:
+    names = [str(name).strip() for name in (plan.get("names") or []) if str(name).strip()]
+    if names:
+        return "灯灯要查的是" + "、".join(names[:3])
+    body = str(question or "").strip().rstrip("？?。！!")
+    if body:
+        return f"灯灯要查的是{body}"
+    return "灯灯要查的就是这一句"
 
 
 def search_knowledge(question: str) -> dict:
-    """同步查找。只用程序规则理解意图，不调模型。"""
-    plan = plan_query(question, allow_model=False)
+    """同步查找。计划由模型给出。"""
+    plan = plan_query(question, allow_model=True)
     return lookup_by_plan(question, plan)
 
 
@@ -951,37 +913,61 @@ def _retrieve_query(question: str, plan: dict) -> str:
     return " ".join(unique) if unique else (question or "")
 
 
+def _visible_hit(hit: dict) -> str:
+    title = str((hit or {}).get("title") or "").strip()
+    plates = {
+        "板块 A": "属性相克",
+        "板块 B": "能量",
+        "板块 C": "血脉",
+        "板块 D": "战斗道具",
+        "板块 G": "技能",
+        "板块 M": "伤害",
+        "板块 N": "特性",
+    }
+    compact = title.replace(" ", "")
+    for plate, say in plates.items():
+        if plate in title or compact == plate.replace(" ", ""):
+            return say
+    if "·" in title:
+        name, form = [part.strip() for part in title.split("·", 1)]
+        return f"{name}（{form}）" if name else title
+    source = Path(str((hit or {}).get("source") or "")).stem
+    name = title or source
+    if name.lower().endswith(".json") or name.lower().endswith(".md"):
+        name = Path(name).stem
+    if name.startswith("板块"):
+        return ""
+    return name
+
+
 def _lookup_detail(question: str, result: dict) -> str:
     if result.get("intent") == "lookup_skill":
         names = "、".join(result.get("names") or []) or "、".join(
-            hit.get("title") or "" for hit in result.get("hits") or [] if hit.get("kind") == "skill"
+            _visible_hit(hit) for hit in result.get("hits") or [] if hit.get("kind") == "skill" and _visible_hit(hit)
         )
-        return f"命中技能 {names}" if names else "没有命中技能"
+        return f"正在看技能{names}" if names else "名录里没有对上的技能"
     if result.get("intent") == "mechanic_defend":
-        return "机制：防御类应对攻击会减伤"
+        return "正在看防御时会减伤这一条"
     if result.get("intent") in {"list", "recommend"}:
-        types = "、".join(result.get("types") or []) or "未识别"
         names = "、".join(
-            hit.get("title") or ""
+            _visible_hit(hit)
             for hit in result.get("hits") or []
-            if hit.get("kind") == "pokemon"
-        ) or "无"
-        return f"类型过滤：{types}，命中{names}"
-    if not result.get("found"):
-        return "没有结构化命中"
-    focus = (_search_terms(question) or [""])[0]
+            if hit.get("kind") == "pokemon" and _visible_hit(hit)
+        )
+        return f"正在看{names}" if names else "名录里没有对上的精灵"
+    shown = []
     for hit in result.get("hits") or []:
-        if hit.get("kind") != "pokemon":
-            continue
-        title = hit.get("title") or ""
-        if "·" in title:
-            name, boss = [part.strip() for part in title.split("·", 1)]
-            return f"命中{name}.json（boss={boss}）"
-        filename = Path(hit.get("source") or "").name or title
-        if focus and focus in (hit.get("text") or ""):
-            return f"命中{filename}"
-    titles = "、".join(item.get("title") or "" for item in (result.get("hits") or [])[:3])
-    return f"命中{titles}" if titles else "没有结构化命中"
+        name = _visible_hit(hit)
+        if name and name not in shown:
+            shown.append(name)
+        if len(shown) >= 3:
+            break
+    if shown:
+        return "正在看" + "、".join(shown)
+    body = str(question or "").strip().rstrip("？?。！!")
+    if not result.get("found"):
+        return f"名录里没有直接写「{body or '这一句'}」"
+    return f"正在看和「{body or '这一句'}」有关的资料"
 
 
 def _pokemon_page(mon: dict) -> str:
@@ -1004,7 +990,12 @@ def knowledge_documents() -> list:
     for chunk in rule_chunks():
         documents.append(Document(
             page_content=chunk["text"],
-            metadata={"source": "knowledge/rules.md", "section": chunk["section"]},
+            metadata={
+                "source": "knowledge/rules.md",
+                "section": chunk["section"],
+                "parent_id": chunk.get("parent_id") or "",
+                "chunk_type": chunk.get("chunk_type") or "section",
+            },
         ))
     for mon in load_pokemon():
         name = mon["name"]
@@ -1052,22 +1043,38 @@ def ensure_knowledge_index():
             return None, "skip", _index_unavailable
 
 
-def retrieve_passages(query: str) -> tuple:
-    """返回 (hits, status, detail)。索引未就绪时 skip，不抛错。"""
-    retriever, index_state, index_detail = ensure_knowledge_index()
-    if retriever is None:
-        return [], "skip", index_detail or "向量不可用，未召回", index_state
-    try:
-        hits = _retrieved_hits(retriever, query)
-    except Exception:
-        return [], "skip", "召回失败，沿用结构化结果", index_state
+def _passage_detail(hits: list, prefix: str = "") -> str:
     names = []
     for hit in hits:
-        filename = Path(hit["source"]).name
-        if filename not in names:
-            names.append(filename)
-    shown = "、".join(names[:2]) or "无"
-    return hits, "done", f"召回 {len(hits)} 条，来源 {shown}", index_state
+        name = _visible_hit(hit)
+        if name and name not in names:
+            names.append(name)
+    if names:
+        return "正在看" + "、".join(names[:3])
+    return "名录里翻过这一处"
+
+
+def retrieve_passages(query: str) -> tuple:
+    """返回 (hits, status, detail, index_state)。向量库未就绪时改用中文分词。"""
+    retriever, index_state, index_detail = ensure_knowledge_index()
+    hits = []
+    if retriever is not None:
+        try:
+            hits = _retrieved_hits(retriever, query)
+        except Exception:
+            hits = []
+    if hits:
+        return hits, "done", _passage_detail(hits, "召回"), index_state
+    try:
+        from agents.work_cycle import bm25_hits
+
+        hits = bm25_hits(query)
+    except Exception:
+        logger.warning("中文分词检索未完成")
+        return [], "skip", index_detail or "未召回", index_state
+    if not hits:
+        return [], "skip", index_detail or "未召回", index_state or "bm25"
+    return hits, "done", _passage_detail(hits, "中文分词召回"), "bm25"
 
 
 def _retrieved_hits(retriever, question: str) -> list:
@@ -1202,7 +1209,32 @@ def _keeps_facts(generated: str, structured: dict) -> bool:
     for token in structured.get("must_tokens") or []:
         if token and token not in generated:
             return False
+    allowed = "\n".join([
+        source,
+        structured.get("answer") or "",
+        " ".join(structured.get("must_names") or []),
+    ])
+    for name in re.findall(r"系的([\u4e00-\u9fff]{2,6})", generated):
+        if name not in allowed:
+            return False
+    for phrase in ("核心伙伴", "的对手是"):
+        if phrase in generated and phrase not in allowed:
+            return False
+    if _repeats(generated):
+        return False
     return True
+
+
+def _repeats(text: str) -> bool:
+    """同一小段翻来覆去，就不当成回答。"""
+    compact = re.sub(r"\s+", "", text or "")
+    if len(compact) < 24:
+        return False
+    for size in range(4, 9):
+        piece = compact[:size]
+        if piece and compact.count(piece) >= 6:
+            return True
+    return False
 
 
 _OFF_GAME = re.compile(r"宝可梦|神奇宝贝|口袋妖怪|52poke|bulbapedia|pokemon|pokémon", re.I)
@@ -1241,7 +1273,7 @@ def _on_game_page(item: dict) -> bool:
     if _OFF_GAME.search(blob) or _PAGE_GAME.search(blob):
         return False
     host = _host_of(item.get("url") or "")
-    if any(skip in host for skip in ("4399.com", "7k7k.com", "51wan.com", "bilibili.com", "youtube.com")):
+    if any(skip in host for skip in ("4399.com", "7k7k.com", "51wan.com", "youtube.com")):
         return False
     return True
 
@@ -1532,8 +1564,20 @@ def _wiki_lookup(name: str):
 
 
 def _ace_label(question: str) -> str:
-    matched = re.search(r"以\s*(.{1,16}?)\s*为\s*(?:核心|主力)", question or "")
-    return matched.group(1).strip() if matched else ""
+    """「以火神为核心」和「火神为主力」都算点名主力。不把前面的动词算进名字。"""
+    text = question or ""
+    matched = re.search(
+        r"(?:以|用|把)\s*([^\s，。,、！？]{1,12}?)(?:作为|为)(?:核心|主力)",
+        text,
+    )
+    if not matched:
+        matched = re.search(
+            r"([^\s，。,、！？]{1,8}?)(?:作为|为)(?:核心|主力)",
+            text,
+        )
+    if not matched:
+        return ""
+    return re.sub(r"^(?:把|用|让|一只|一套)", "", matched.group(1).strip())
 
 
 def _guest_ready(name: str, card: str) -> dict:
@@ -1636,54 +1680,43 @@ def _compress_extract(name: str, body: str) -> str:
 
 
 def _gather_web(question: str, plan: dict) -> dict:
-    from agents.rag_agent import _leftover_name
-    from pokemon_kb import load_pokemon
-    from web_search import extract_pages, search_web
+    """和协作循环用同一条读取。查询是这条事实，留下对得上的句子。"""
+    from agents.external_mcp import tools_live
+    from agents.web_read import read_web
+    from web_search import read_page, search_web
 
-    subject = _leftover_name(question, load_pokemon())
-    wiki = _wiki_lookup(subject) if subject else None
-    if wiki:
-        return {"reason": "ok", "results": [wiki], "detail": f"读了 {wiki['title']}"}
-    found = []
+    queries = _web_queries(question, plan) or [question]
+    merged = []
     seen = set()
+    reason = "empty"
     detail = "没有查到网页"
-    for query in _web_queries(question, plan):
-        outcome = search_web(query, limit=5)
-        if outcome.get("reason") == "no_key":
+    video_text = None
+    if tools_live():
+        from agents.video_speech import speech_of
+        video_text = speech_of
+    for query in queries[:3]:
+        outcome = read_web(query, search=search_web, open_page=read_page, video_text=video_text)
+        reason = outcome.get("reason") or reason
+        if reason == "no_key":
             return {"reason": "no_key", "results": [], "detail": "未配置密钥"}
-        if outcome.get("reason") == "error" and not found:
-            detail = outcome.get("detail") or "没有查到网页"
-        for item in outcome.get("results") or []:
+        if outcome.get("text"):
+            detail = outcome.get("detail") or detail
+        for item in outcome.get("covered") or []:
             url = item.get("url") or ""
-            blob = f"{item.get('title') or ''} {item.get('snippet') or ''}"
-            if not url or url in seen or not _on_game_page(item):
+            if url and url in seen:
                 continue
-            if subject and subject not in blob:
-                continue
-            seen.add(url)
-            found.append({"title": item.get("title") or url, "url": url, "snippet": item.get("snippet") or ""})
-            if len(found) >= 5:
-                break
-        if len(found) >= 5:
-            break
-    if not found:
-        return {"reason": "empty", "results": [], "detail": detail}
-    found.sort(key=_page_rank)
-    pages = extract_pages([item["url"] for item in found[:2]])
-    kept = []
-    for item in found:
-        if len(kept) >= 2:
-            break
-        raw = pages.get(item["url"]) or item.get("snippet") or ""
-        brief = _compress_extract(subject, raw)
-        if not brief:
-            continue
-        item["extract"] = brief
-        kept.append(item)
-    if not kept:
-        return {"reason": "empty", "results": [], "detail": "打开了页面，没读出可用正文"}
-    titles = "、".join(item["title"][:18] for item in kept)
-    return {"reason": "ok", "results": kept, "detail": f"读了 {titles}"}
+            if url:
+                seen.add(url)
+            merged.append({
+                "title": item.get("title") or url,
+                "url": url,
+                "snippet": item.get("text") or "",
+                "extract": item.get("text") or "",
+            })
+    if not merged:
+        return {"reason": "empty" if reason == "ok" else reason, "results": [], "detail": detail}
+    titles = "、".join(item["title"][:18] for item in merged[:3])
+    return {"reason": "ok", "results": merged, "detail": f"读了 {titles}"}
 
 
 def _append_web_sources(answer: str, web_results: list) -> str:
@@ -1700,52 +1733,21 @@ def _append_web_sources(answer: str, web_results: list) -> str:
 
 def _matchup_pair(question: str):
     """问句里点了两只，并且在问输赢。顺序按原句里先出现的名字。"""
-    text = question or ""
-    if not re.search(r"对战|谁会赢|谁赢|打得过", text):
-        return None
-    from pokemon_kb import _mentioned_names, _name_stem, load_pokemon
+    from agents.battle_agent import matchup_pair
 
-    names = []
-    for name in _mentioned_names(text, load_pokemon()):
-        if name not in names:
-            names.append(name)
-    if len(names) < 2:
-        return None
-
-    def position(name: str) -> int:
-        stem = _name_stem(name)
-        spots = [text.find(token) for token in (name, stem) if token and token in text]
-        return min(spots) if spots else len(text)
-
-    ranked = sorted(names, key=position)
-    return ranked[0], ranked[1]
+    return matchup_pair(question)
 
 
 def _bout_payload(left: str, right: str):
-    from agents.dengdeng_persona import matchup_spoken
-    from battle import scripted_bout
+    from agents.battle_agent import bout_payload
 
-    bout = scripted_bout(left, right)
-    if not bout.get("ok") or not bout.get("frames"):
-        return None
-    return {
-        "sprite_a": left,
-        "sprite_b": right,
-        "winner": bout.get("winner") or "",
-        "spoken": matchup_spoken(left, right, bout.get("winner") or ""),
-        "lines": bout.get("lines") or [],
-        "frames": bout.get("frames") or [],
-        "ok": True,
-    }
+    return bout_payload(left, right)
 
 
 def _trial_view(battle: dict) -> dict:
-    return {
-        "intro": "灯灯来想一想，这两只精灵对战会是什么情况呢，让灯灯来模拟一下。",
-        "closing": battle.get("spoken") or "",
-        "frames": battle.get("frames") or [],
-        "pace_ms": 2000,
-    }
+    from agents.battle_agent import trial_view
+
+    return trial_view(battle)
 
 
 def _looks_like_call(text: str) -> bool:
@@ -1864,17 +1866,120 @@ def _store_web_page(session_id: str, question: str, web_results: list) -> None:
     remember_page(session_id, name, card, kept)
 
 
-def run_knowledge_search(question: str, report, use_web: bool = False, session_id: str = "") -> dict:
-    """先拆问题。胜负题去模拟对战，名录里没有的名字直接说没翻到，其余再查本地。"""
+def run_knowledge_search(
+    question: str,
+    report,
+    use_web: bool = False,
+    session_id: str = "",
+    skip_intent: bool = False,
+    history=None,
+    user_id: str = "",
+    prepared: dict = None,
+    skip_learn: bool = False,
+) -> dict:
+    """监督者决定这一问派给谁。跳过听要求时，这里只做名录检索。"""
     text = (question or "").strip()
+    anchor = ""
+    if not skip_intent:
+        from agents.turn_memory import carry_subject
+
+        carried = carry_subject(text, session_id)
+        text = carried["query"]
+        anchor = carried["anchor"]
+    original = text
     from agents.chat_notebook import learn, recall_pages, style_sentence
     from agents.rag_agent import search_preface
     from agents.thoughts import note_thought
 
-    fresh = learn(session_id, text)
+    fresh = [] if skip_learn else learn(session_id, text)
     if fresh:
         note_thought("灯灯记下你的规矩了")
-    report("parse", "running", "", "正在理解问题…")
+    from agents.chat_notebook import (
+        alias_bridge,
+        apply_aliases,
+        apply_page_text,
+    )
+
+    if prepared is None or anchor:
+        from agents.work_cycle import prepare_turn
+
+        prepared = prepare_turn(original, history or [], user_id, anchor=anchor)
+    lookup = (prepared or {}).get("query") or original
+    if not skip_intent:
+        from agents.intent_judge import judge_intent
+        from agents.supervisor import run_cycle
+
+        judged = judge_intent(original)
+        if judged.get("intent"):
+            heard = {
+                "search": "查资料",
+                "lineup": "配一套",
+                "order": "改仓库",
+                "battle": "问谁赢",
+                "remember": "补充资料",
+            }.get(judged.get("intent") or "", "办这件事")
+            from agents.react_stream import streaming
+
+            if not streaming():
+                note_thought(f"灯灯听出来这是在{heard}：{original}")
+
+        def lookup_call(utterance, web_on, sid):
+            return run_knowledge_search(
+                utterance,
+                report,
+                use_web=bool(web_on and use_web),
+                session_id=sid,
+                skip_intent=True,
+                history=history,
+                user_id=user_id,
+                prepared=prepared,
+                skip_learn=True,
+            )
+
+        def web_call(query):
+            if not use_web:
+                return {"reason": "off", "results": []}
+            from web_search import search_web
+
+            return search_web(query)
+
+        cycle = run_cycle(
+            original,
+            session_id=session_id,
+            judged=judged,
+            prepared=prepared,
+            learned=fresh,
+            web=web_call,
+            lookup=lookup_call,
+        )
+        order = cycle.get("order") or {}
+        from agents.turn_memory import close_turn
+
+        close_turn(session_id, original, judged.get("intent") or "")
+        report("done", "done", "这一问办完了", "检索完成")
+        return {
+            "found": bool(order.get("ok") or order.get("trial")),
+            "answer": order.get("answer") or "",
+            "hits": [],
+            "sources": [],
+            "web_sources": [],
+            "trial": order.get("trial"),
+            "job": cycle.get("ledger"),
+            "resolved": original,
+            "intent": judged.get("intent") or "",
+        }
+    elif lookup:
+        text = lookup
+    bridge = alias_bridge(session_id, text)
+    text = apply_aliases(session_id, text)
+
+    def _with_bridge(answer: str) -> str:
+        body = answer or ""
+        if not bridge or not body or bridge in body:
+            return body
+        return bridge + "\n" + body
+
+    report("parse", "running", text, "正在理解问题…")
     preface = search_preface(text)
     remembered = recall_pages(session_id, text)
     from pokemon_kb import _mentioned_names, load_pokemon
@@ -1917,11 +2022,16 @@ def run_knowledge_search(question: str, report, use_web: bool = False, session_i
         if habit and habit not in answer:
             answer = answer.rstrip() + "\n\n" + habit
         answer = _append_web_sources(answer, card["sources"])
-        report("generate", "done", "灯灯按这段对话里记下的讲", "正在合并结果…")
+        report(
+            "generate",
+            "done",
+            "灯灯按这段对话里记下的讲",
+            "正在合并结果…",
+        )
         report("done", "done", "用的是这段对话里的资料", "检索完成")
         return {
             "found": True,
-            "answer": answer,
+            "answer": _with_bridge(answer),
             "hits": [{"title": page.get("name") or "", "text": page.get("text") or "", "source": "这段对话"} for page in remembered],
             "sources": ["这段对话"],
             "web_sources": [{"title": item.get("title") or "", "url": item.get("url") or ""} for item in card["sources"]],
@@ -1934,7 +2044,7 @@ def run_knowledge_search(question: str, report, use_web: bool = False, session_i
         report("done", "done", "没有翻到", "检索完成")
         return {
             "found": False,
-            "answer": preface.get("answer") or "灯灯没有翻到相关信息。",
+            "answer": _with_bridge(preface.get("answer") or "灯灯没有翻到相关信息。"),
             "hits": [],
             "sources": [],
             "web_sources": [],
@@ -1948,7 +2058,7 @@ def run_knowledge_search(question: str, report, use_web: bool = False, session_i
         report("done", "done", "模拟对战", "检索完成")
         return {
             "found": True,
-            "answer": preface["trial"]["intro"],
+            "answer": _with_bridge(preface["trial"]["intro"]),
             "hits": [],
             "sources": [],
             "web_sources": [],
@@ -1982,10 +2092,14 @@ def run_knowledge_search(question: str, report, use_web: bool = False, session_i
         report("retrieve", "skip", "名录里没有", "灯灯到外面看一眼")
     else:
         plan = plan_query(text, allow_model=True)
-        report("parse", "done", _parse_detail(plan), "正在按意图查找…")
+        structured = lookup_by_plan(text, plan)
+        subs = [text]
+        if len(subs) > 1:
+            report("parse", "done", "拆成 " + "；".join(subs), "正在按意图查找…")
+        else:
+            report("parse", "done", _parse_detail(plan, text), "正在按意图查找…")
 
         report("lookup", "running", "", "正在按意图查找…")
-        structured = lookup_by_plan(text, plan)
         report("lookup", "done", _lookup_detail(text, structured), "正在准备知识索引…")
 
         query = _retrieve_query(text, plan)
@@ -2009,15 +2123,18 @@ def run_knowledge_search(question: str, report, use_web: bool = False, session_i
                 report("retrieve", "skip", retrieve_detail or "向量不可用，未召回", "正在合并结果…")
         hits = _merge_hits(structured.get("hits") or [], retrieved)
 
+    from agents.fact_read import outside_query
+
     web_results = []
     web_reason = "off"
-    if hits:
-        report("web", "skip", "百科已经有了" if use_web else "未开启联网", "正在根据资料生成回答…")
+    missing_outside = outside_query(text)
+    if hits and not missing_outside:
+        report("web", "skip", "百科已经有了", "正在根据资料生成回答…")
     elif not use_web:
         report("web", "skip", "未开启联网", "正在根据资料生成回答…")
     else:
         report("web", "running", "", "正在联网搜寻…")
-        gathered = _gather_web(text, plan)
+        gathered = _gather_web(missing_outside or text, plan)
         web_reason = gathered.get("reason") or "empty"
         web_results = gathered.get("results") or []
         if web_reason == "no_key":
@@ -2029,6 +2146,7 @@ def run_knowledge_search(question: str, report, use_web: bool = False, session_i
         else:
             report("web", "skip", gathered.get("detail") or "没有查到网页", "正在根据资料生成回答…")
 
+    voice_hits, voice_web, evidence = list(hits or []), list(web_results or []), {}
     fc = _attach_prompt_fc(text, structured, hits)
     battle = (fc or {}).get("battle") or {}
     if not battle.get("frames"):
@@ -2039,14 +2157,63 @@ def run_knowledge_search(question: str, report, use_web: bool = False, session_i
     fallback_voice = _safe_fallback(structured)
     local_answer = (structured.get("answer") or "").strip()
     generated = ""
+    degrade = ""
+    focused_pages = []
+    for hit in hits or []:
+        title = (hit.get("title") or "").split("·")[0].strip()
+        body = hit.get("text") or ""
+        if title and body:
+            focused_pages.append({"name": title, "text": body})
+    for item in web_results or []:
+        body = item.get("extract") or ""
+        if not body.startswith("精灵："):
+            continue
+        matched = re.search(r"^精灵：(.+)$", body, re.M)
+        title = (item.get("title") or "").split("·")[-1].strip()
+        name = (matched.group(1).strip() if matched else "") or title
+        if name and body:
+            focused_pages.append({"name": name, "text": body})
+    focused = ""
+    if voice_hits:
+        voiced = []
+        for hit in voice_hits:
+            item = dict(hit)
+            title = (item.get("title") or "").split("·")[0].strip()
+            item["text"] = apply_page_text(session_id, title, item.get("text") or "")
+            voiced.append(item)
+        voice_hits = voiced
+    def _by_prompt(seed_text: str, hits_for_voice: list) -> str:
+        """用灯灯的提示词换说法。教师不可用或说走样时，退回程序原文。"""
+        nonlocal degrade
+        payload = dict(structured or {})
+        payload["spoken_seed"] = seed_text
+        payload["answer"] = seed_text or payload.get("answer") or ""
+        try:
+            spoken = _clean_voice(
+                _generate_answer(text, hits_for_voice, [], payload),
+                seed_text,
+            )
+            report("generate", "done", "灯灯按提示词换了说法", "正在合并结果…")
+            return spoken
+        except TimeoutError:
+            degrade = "教师超时"
+            report("generate", "skip", "等待模型超时，灯灯改讲自己记得的", "正在合并结果…")
+            return seed_text
+        except Exception as exc:
+            logger.warning("检索生成失败: %s", type(exc).__name__)
+            degrade = "教师不可用"
+            report("generate", "skip", "模型不可用，灯灯改讲自己记得的", "正在合并结果…")
+            return seed_text
+
     if trial:
         generated = trial["intro"]
         report("generate", "done", "灯灯开始模拟这场对战", "正在合并结果…")
+    elif focused:
+        report("generate", "running", "", "灯灯正在用自己的口气讲…")
+        generated = _by_prompt(focused, voice_hits or [{"title": "记下的栏目", "text": focused}])
     elif plan.get("focus") in {"skill", "pool", "damage"} and local_answer and local_answer != "知识库没有这项资料。":
-        from agents.dengdeng_persona import wrap_facts
-
-        generated = wrap_facts(local_answer)
-        report("generate", "done", "灯灯按翻到的类别讲", "正在合并结果…")
+        report("generate", "running", "", "灯灯正在用自己的口气讲…")
+        generated = _by_prompt(local_answer, voice_hits or [{"title": "记下的类别", "text": local_answer}])
     elif not hits and web_results:
         chunks = [item.get("extract") or "" for item in web_results if item.get("extract")]
         from agents.rag_agent import _leftover_name
@@ -2075,15 +2242,17 @@ def run_knowledge_search(question: str, report, use_web: bool = False, session_i
     else:
         report("generate", "running", "", "灯灯正在把资料说给小洛克听…")
         try:
-            web_for_voice = [] if hits else web_results
-            generated = _clean_voice(_generate_answer(text, hits, web_for_voice, structured), fallback_voice)
-            report("generate", "done", "灯灯已根据给定资料作答", "正在合并结果…")
+            web_for_voice = [] if hits else voice_web
+            generated = _clean_voice(_generate_answer(text, voice_hits, web_for_voice, structured), fallback_voice)
+            report("generate", "done", "灯灯按刚翻到的这些讲", "正在合并结果…")
         except TimeoutError:
             generated = fallback_voice
+            degrade = "教师超时"
             report("generate", "skip", "等待模型超时，灯灯改讲自己记得的", "正在合并结果…")
         except Exception as exc:
             logger.warning("检索生成失败: %s", type(exc).__name__)
             generated = fallback_voice
+            degrade = "教师不可用"
             report("generate", "skip", "模型不可用，灯灯改讲自己记得的", "正在合并结果…")
 
     if generated:
@@ -2108,6 +2277,7 @@ def run_knowledge_search(question: str, report, use_web: bool = False, session_i
     if note and note not in answer:
         answer = answer.rstrip() + "\n\n" + note
     sources = _sources_of(hits)
+    job = None
     report("done", "done", f"合并 {len(hits)} 条资料", "检索完成")
     return {
         "found": bool(hits) or bool(web_results),
@@ -2116,4 +2286,12 @@ def run_knowledge_search(question: str, report, use_web: bool = False, session_i
         "sources": sources,
         "web_sources": [] if hits else [{"title": item["title"], "url": item["url"]} for item in web_results],
         "trial": trial,
+        "job": job.model_dump() if job else {},
+        "evidence": {
+            "kept_ids": evidence.get("kept_ids") or [],
+            "dropped_ids": evidence.get("dropped_ids") or [],
+            "cites": evidence.get("cites") or [],
+            "conflicts": evidence.get("conflicts") or [],
+            "compression_ratio": evidence.get("compression_ratio") or 1,
+        },
     }

@@ -158,42 +158,8 @@ def _wants_patch(text: str) -> bool:
     return bool(re.search(r"换为|换成|替换|改为|改成|修改", text or ""))
 
 
-def is_counter_talk(question: str) -> bool:
-    """仓库、加减数量、已记下的出场方案。普通「帮我配队」不算。"""
-    text = str(question or "").strip()
-    if not text:
-        return False
-    if "仓库" in text:
-        return True
-    if _wants_delete_team(text) or _wants_release(text) or _wants_patch(text):
-        return True
-    if re.search(r"(加入|新增|添|放进|减少|收回).{0,20}只", text):
-        return True
-    if re.search(r"(加入|新增|帮我).{0,8}一只", text):
-        if not re.search(r"组建|组队|组一队|组一套|配队|配一队|队伍|为核心|出场", text):
-            return True
-    if _asks_saved_lineup(text) and not _is_new_lineup(text):
-        return True
-    if "修改" in text and ("编号" in text or "套出场" in text):
-        return True
-    return False
-
-
-def wants_lineup(question: str) -> bool:
-    """只有原句明确要排六人时才组队。看仓库、加减数量、查看已有出场都不算。"""
-    text = str(question or "").strip()
-    if not text or is_counter_talk(text):
-        return False
-    if _asks_saved_lineup(text) and not _is_new_lineup(text):
-        return False
-    return bool(re.search(
-        r"配一队|配队|组一队|组队|排一套|排好出场|组建|组一套|排一支|队伍|出场阵容|以.+?系为主",
-        text,
-    ))
-
-
-def run_battle_order(question: str) -> dict:
-    """一句话先变成 JSON，再执行。听不懂或名字不对就不改仓库和出场。"""
+def run_battle_order(question: str, session_id: str = "") -> dict:
+    """模型输出要调用的仓库工具，程序只执行这一份 JSON。"""
     from agents.thoughts import note_thought
 
     text = str(question or "").strip()
@@ -203,7 +169,6 @@ def run_battle_order(question: str) -> dict:
     parsed, rounds = _ask(text)
     name = str((parsed or {}).get("name") or "")
     arguments = (parsed or {}).get("arguments") if isinstance((parsed or {}).get("arguments"), dict) else {}
-    name, arguments = _correct_order(text, name, arguments or {})
     if rounds:
         rounds[-1]["parsed"] = {"name": name, "arguments": arguments}
     if name not in _ALLOWED or name == "none":
@@ -215,7 +180,14 @@ def run_battle_order(question: str) -> dict:
     except Exception as exc:
         logger.warning("battle order stopped: %s", type(exc).__name__)
         answer, ok, roster = "灯灯这会儿没接上话。", False, ""
-    return _done(text, answer, ok, rounds, roster)
+    return _done(
+        text,
+        answer,
+        ok,
+        rounds,
+        roster,
+        extra={"tool": name, "skipped_write": not ok},
+    )
 
 
 def _ask(question: str) -> tuple:
@@ -280,10 +252,10 @@ def _dispatch(name: str, arguments: dict, question: str) -> tuple:
     return sentence, ok, ""
 
 
-def _done(question: str, answer: str, ok: bool, rounds: list, roster: str = "") -> dict:
+def _done(question: str, answer: str, ok: bool, rounds: list, roster: str = "", extra: dict = None) -> dict:
     spoken = _speak(answer, ok)
     try:
-        _write_trace(question, "battle_order", rounds)
+        _write_trace(question, "battle_order", rounds, extra)
     except Exception as exc:
         logger.warning("battle order trace skipped: %s", type(exc).__name__)
     return {
@@ -406,6 +378,21 @@ def _write_table(path: str, csv_text: str) -> None:
     local.write_text((csv_text or "").rstrip() + "\n", encoding="utf-8")
 
 
+def hold_table(path: str, csv_text: str, preview: str, speech: str, label: str, roster: str = ""):
+    """这一轮若在等确认，只寄存。否则立刻改表，并记一条 Edited。"""
+    from agents.thoughts import note_edit, note_thought
+    from agents.write_confirm import armed, stage_table
+
+    if armed():
+        pending = stage_table(path, csv_text, preview, speech, label, roster)
+        note_edit(preview)
+        note_thought(f"待确认 {pending['token']}")
+        return pending
+    _write_table(path, csv_text)
+    note_edit(label)
+    return None
+
+
 def _catalog():
     from pokemon_kb import _by_name, load_pokemon
 
@@ -502,38 +489,6 @@ def _list_warehouse() -> tuple:
     return "仓库里灯灯看见" + "、".join(spoken) + "。", True
 
 
-def _correct_order(question: str, name: str, arguments: dict) -> tuple:
-    text = str(question or "")
-    args = dict(arguments or {})
-    looking = "仓库" in text and re.search(r"有什么|有哪些|看看|里有", text)
-    changing = bool(_deltas_from_text(text)) and re.search(r"加入|新增|减少|收回|添|放生|丢掉|不要了", text)
-    if _wants_release(text):
-        return "change_warehouse", args
-    if looking and not changing:
-        return "list_warehouse", {}
-    if changing:
-        return "change_warehouse", args
-    if _wants_delete_team(text):
-        return "delete_team", {"team_id": _team_id_from_text(text)}
-    if _wants_patch(text):
-        payload = {"team_id": _team_id_from_text(text)}
-        changes = _changes_from_text(text)
-        if changes:
-            payload["changes"] = changes
-        elif args:
-            payload.update(args)
-            payload["team_id"] = _team_id_from_text(text)
-        return "patch_team", payload
-    if _asks_saved_lineup(text) and not _is_new_lineup(text):
-        team_id = _team_id_from_text(text)
-        if team_id:
-            return "list_teams", {"team_id": team_id}
-        return "list_teams", {}
-    if wants_lineup(text):
-        return "save_team", {}
-    return "none", {}
-
-
 def _team_id_from_text(text: str):
     match = re.search(r"第\s*(\d+)\s*套", text or "")
     if match:
@@ -562,12 +517,6 @@ def _deltas_from_text(question: str) -> list:
         if not name or count is None or count <= 0:
             continue
         found.append({"name": name, "delta": sign * count})
-    if found or not release or _wants_delete_team(text):
-        return found
-    from pokemon_kb import _mentioned_names, load_pokemon
-
-    for name in _mentioned_names(text, load_pokemon()):
-        found.append({"name": name, "delta": -1})
     return found
 
 
@@ -592,13 +541,6 @@ def _deltas_from_arguments(arguments: dict) -> list:
 
 def _change_warehouse(arguments: dict, question: str = "") -> tuple:
     pairs = _deltas_from_arguments(arguments)
-    spoken_pairs = _deltas_from_text(question)
-    if _wants_release(question) and spoken_pairs:
-        pairs = spoken_pairs
-    elif len(spoken_pairs) > 1:
-        pairs = spoken_pairs
-    elif not pairs:
-        pairs = spoken_pairs
     resolved = []
     unknown = []
     for item in pairs:
@@ -615,7 +557,12 @@ def _change_warehouse(arguments: dict, question: str = "") -> tuple:
     if unknown and not resolved:
         return "灯灯没见过这只伙伴。", False
     if not resolved:
-        return "灯灯没听懂小洛克的意思。", False
+        return "告诉灯灯改几只。", False
+    for item in resolved:
+        number = abs(int(item["delta"]))
+        spoken = str(number) in (question or "") or _count_word(number) in (question or "")
+        if not spoken:
+            return "告诉灯灯改几只。", False
     rows = _warehouse_rows(_read_table(WAREHOUSE))
     for item in resolved:
         index = next((pos for pos, row in enumerate(rows) if row["name"] == item["name"]), None)
@@ -627,23 +574,27 @@ def _change_warehouse(arguments: dict, question: str = "") -> tuple:
             rows.append({"name": item["name"], "count": updated})
         else:
             rows[index]["count"] = updated
-    _write_table(WAREHOUSE, _warehouse_text(rows))
     added = [item for item in resolved if item["delta"] > 0]
     removed = [item for item in resolved if item["delta"] < 0]
     parts = []
+    preview_parts = []
     if added:
         bits = [f"{_count_word(item['delta'])}只{item['name']}" for item in added]
         parts.append("灯灯帮你在仓库里多放了" + "、".join(bits) + "。")
+        preview_parts.append("灯灯准备在仓库里多放" + "、".join(bits) + "。")
     if removed:
         bits = [f"{_count_word(abs(item['delta']))}只{item['name']}" for item in removed]
         if _wants_release(question):
             parts.append("灯灯帮你放生了" + "、".join(bits) + "。")
+            preview_parts.append("灯灯准备放生" + "、".join(bits) + "。")
         else:
             parts.append("灯灯帮你在仓库里收回了" + "、".join(bits) + "。")
-    from agents.thoughts import note_edit
-
-    note_edit("仓库")
-    return "".join(parts), True
+            preview_parts.append("灯灯准备在仓库里收回" + "、".join(bits) + "。")
+    speech = "".join(parts)
+    preview = "".join(preview_parts) + "确认后才记下。"
+    if hold_table(WAREHOUSE, _warehouse_text(rows), preview, speech, "仓库"):
+        return preview, False
+    return speech, True
 
 
 def _team_rows(text: str) -> list:
@@ -823,10 +774,10 @@ def _stock() -> dict:
 
 def _roster_unbounded(question: str) -> bool:
     """句中写明可以不局限仓库时，出场只要求精灵在名录里。"""
-    return bool(re.search(r"不局限仓库|不必局限|不限于仓库|不限制仓库", question or ""))
+    return bool(re.search(r"不局限|不必局限|不限于仓库|不限制仓库|不(?:需要|必|得)?拘泥|不用仓库", question or ""))
 
 
-def _save_team(question: str, names: list = None, replace_id: int = None) -> tuple:
+def _save_team(question: str, names: list = None, replace_id: int = None, session_id: str = "") -> tuple:
     from pokemon_kb import (
         _can_boss,
         _name_stem,
@@ -858,7 +809,7 @@ def _save_team(question: str, names: list = None, replace_id: int = None) -> tup
         if len(picked) != 6 or len(set(stems)) != 6:
             return "这样改不了，同一套里不能有同种伙伴。", False, ""
         proposed = "队伍配置为" + "、".join(picked)
-    filled = complete_team_answer(proposed, question, allowed=allowed) if proposed else ""
+    filled = complete_team_answer(proposed, question, allowed=allowed, session_id=session_id) if proposed else ""
     parsed = parse_team_config(filled) if filled else {"members": [], "item": ""}
     members = parsed.get("members") or []
     if len(members) != 6:
@@ -909,17 +860,25 @@ def _save_team(question: str, names: list = None, replace_id: int = None) -> tup
     grouped[team_id] = {}
     for slot, (name, blood, skills, item_name) in enumerate(built, start=1):
         grouped[team_id][slot] = _row(team_id, slot, name, blood, skills, item_name)
-    _write_table(TEAMS, _teams_text(grouped))
-    from agents.thoughts import note_edit
-
-    note_edit(f"第 {team_id} 套出场")
     sentence = sentence_head + _team_sentence(team_id, grouped[team_id])
+    if session_id:
+        from agents.chat_notebook import session_type_overrides
+
+        for name, kinds in session_type_overrides(session_id).items():
+            needle = f"是{name}，"
+            shown = f"是{name}，属性是{kinds[0]}系，"
+            if needle in sentence and shown not in sentence:
+                sentence = sentence.replace(needle, shown, 1)
     if _team_evolve_awkward(item, [blood for _name, blood, _skills, _item in built]):
         sentence += "这样不太妥当。"
-    return sentence, True, _sheet_roster(grouped[team_id])
+    roster = _sheet_roster(grouped[team_id])
+    preview = f"灯灯准备记下第 {team_id} 套出场。确认后才记下。"
+    if hold_table(TEAMS, _teams_text(grouped), preview, sentence, f"第 {team_id} 套出场", roster):
+        return preview, False, roster
+    return sentence, True, roster
 
 
-def _save_with_guest(question: str, companions: list, guest: dict) -> tuple:
+def _save_with_guest(question: str, companions: list, guest: dict, replace_id: int = None) -> tuple:
     """五名仓库伙伴沿用原来的补招。主力来自这段对话记下的卡片，不写进名录，也不扣仓库。"""
     from pokemon_kb import complete_team_answer, format_team_answer, parse_team_config
 
@@ -960,19 +919,26 @@ def _save_with_guest(question: str, companions: list, guest: dict) -> tuple:
     reason = f"以{guest_name}为主力，标签{tag_text}，首领化{boss_text}。" + (parsed.get("reason") or "")
     roster = format_team_answer(members, item, reason)
     grouped = _group_teams(_team_rows(_read_table(TEAMS)))
-    team_id = (max(grouped) if grouped else 0) + 1
+    if replace_id is not None:
+        if replace_id not in grouped:
+            return f"灯灯找不到第 {replace_id} 套出场。", False, ""
+        team_id = replace_id
+        sentence_head = f"灯灯改好了第 {team_id} 套出场。"
+    else:
+        team_id = (max(grouped) if grouped else 0) + 1
+        sentence_head = "灯灯记下了第 " + str(team_id) + " 套出场。"
     grouped[team_id] = {}
     for slot, member in enumerate(members, start=1):
         skills = [skill.get("name") or "" for skill in (member.get("skills") or [])]
         grouped[team_id][slot] = _row(team_id, slot, member["name"], member.get("blood") or "", skills, item)
-    _write_table(TEAMS, _teams_text(grouped))
-    from agents.thoughts import note_edit
-
-    note_edit(f"第 {team_id} 套出场")
-    sentence = "灯灯记下了第 " + str(team_id) + " 套出场。" + _team_sentence(team_id, grouped[team_id])
+    sentence = sentence_head + _team_sentence(team_id, grouped[team_id])
     if _team_evolve_awkward(item, [member.get("blood") or "" for member in members]):
         sentence += "这样不太妥当。"
-    return sentence, True, roster or _sheet_roster(grouped[team_id])
+    shown = roster or _sheet_roster(grouped[team_id])
+    preview = f"灯灯准备记下第 {team_id} 套出场。确认后才记下。"
+    if hold_table(TEAMS, _teams_text(grouped), preview, sentence, f"第 {team_id} 套出场", shown):
+        return preview, False, shown
+    return sentence, True, shown
 
 
 def _row(team_id: int, slot: int, name: str, blood: str, skills: list, item: str) -> dict:
@@ -1132,11 +1098,11 @@ def _delete_team(arguments: dict, question: str = "") -> tuple:
     if team_id not in grouped:
         return f"灯灯找不到第 {team_id} 套出场。", False
     del grouped[team_id]
-    _write_table(TEAMS, _teams_text(grouped))
-    from agents.thoughts import note_edit
-
-    note_edit(f"第 {team_id} 套出场")
-    return f"灯灯把第 {team_id} 套出场忘掉了。", True
+    speech = f"灯灯把第 {team_id} 套出场忘掉了。"
+    preview = f"灯灯准备忘掉第 {team_id} 套出场。确认后才记下。"
+    if hold_table(TEAMS, _teams_text(grouped), preview, speech, f"第 {team_id} 套出场"):
+        return preview, False
+    return speech, True
 
 
 def _change_list(arguments: dict, question: str) -> list:
@@ -1276,10 +1242,6 @@ def _patch_team(arguments: dict, question: str = "") -> tuple:
     if len(stems) != len(set(stems)):
         return "这样改不了，同一套里不能有同种伙伴。", False, ""
     grouped[team_id] = working
-    _write_table(TEAMS, _teams_text(grouped))
-    from agents.thoughts import note_edit
-
-    note_edit(f"第 {team_id} 套出场")
     bits = [_member_line(slot, working[slot]) for slot in touched]
     sentence = f"灯灯改好了第 {team_id} 套出场。" + "。".join(bits) + "。"
     if shared_item:
@@ -1288,7 +1250,11 @@ def _patch_team(arguments: dict, question: str = "") -> tuple:
     item = (working.get(1) or {}).get("item") or ""
     if shared_item is not None and _team_evolve_awkward(item, bloods) and previous_item != item:
         sentence += "这样不太妥当。"
-    return sentence, True, _sheet_roster(working)
+    roster = _sheet_roster(working)
+    preview = f"灯灯准备改第 {team_id} 套出场。确认后才记下。"
+    if hold_table(TEAMS, _teams_text(grouped), preview, sentence, f"第 {team_id} 套出场", roster):
+        return preview, False, roster
+    return sentence, True, roster
 
 
 def _inspect(name: str, blood: str, skills: list, item: str) -> list:

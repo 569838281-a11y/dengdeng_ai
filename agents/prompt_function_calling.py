@@ -106,34 +106,47 @@ def _resolve_sprite(label: str) -> str:
 
 
 def _run_trial(arguments: dict) -> tuple:
-    from agents.dengdeng_persona import matchup_spoken
-    from battle import scripted_bout
+    from agents.battle_agent import bout_payload
 
     left = _resolve_sprite(arguments.get("sprite_a") or arguments.get("a") or "")
     right = _resolve_sprite(arguments.get("sprite_b") or arguments.get("b") or "")
     if not left or not right or left == right:
         return "没有对上两只不同的精灵。", None
-    bout = scripted_bout(left, right)
-    spoken = matchup_spoken(left, right, bout.get("winner") or "")
-    lines = bout.get("lines") or []
-    preview = spoken + "\n" + "\n".join(str(line) for line in lines[:8])
-    payload = {
-        "sprite_a": left,
-        "sprite_b": right,
-        "winner": bout.get("winner") or "",
-        "spoken": spoken,
-        "lines": lines,
-        "frames": bout.get("frames") or [],
-        "ok": bool(bout.get("ok")),
-    }
+    payload = bout_payload(left, right)
+    if not payload:
+        return "没有对上两只不同的精灵。", None
+    lines = payload.get("lines") or []
+    preview = (payload.get("spoken") or "") + "\n" + "\n".join(str(line) for line in lines[:8])
+    _keep_bout(payload)
     return preview[:1500], payload
 
 
-def _write_trace(question: str, mode: str, rounds: list) -> None:
+def _keep_bout(payload: dict) -> None:
+    """留下这一场，供以后学习招式，不在这一问里改模型。"""
+    folder = Path(DATA_DIR) / "battle_logs"
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        (folder / f"{stamp}.json").write_text(
+            json.dumps({
+                "sprite_a": payload.get("sprite_a") or "",
+                "sprite_b": payload.get("sprite_b") or "",
+                "winner": payload.get("winner") or "",
+                "lines": payload.get("lines") or [],
+            }, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        logger.warning("对局记录未写下：%s", type(exc).__name__)
+
+
+def _write_trace(question: str, mode: str, rounds: list, extra: dict = None) -> None:
     folder = Path(DATA_DIR) / "fc_traces"
     folder.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     payload = {"question": question, "mode": mode, "rounds": rounds}
+    if extra:
+        payload.update(extra)
     (folder / f"{stamp}.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 

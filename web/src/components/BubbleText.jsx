@@ -14,7 +14,26 @@ function Parts({ parts }) {
   });
 }
 
-export function BubbleText({ text = "", sources = [] }) {
+export function SourceList({ sources = [] }) {
+  if (!sources.length) return null;
+  return (
+    <div className="web-sources">
+      <h3 className="bubble-title">来源</h3>
+      <ul className="space-y-1">
+        {sources.map((item) => (
+          <li key={item.url}>
+            <a href={item.url} target="_blank" rel="noopener" className="font-bold text-grass-deep underline">
+              {item.title}
+            </a>
+            <span className="block break-all text-xs text-[#5d746c]">{item.url}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+export function collectSources(text = "", sources = []) {
   const parsed = parseAnswer(text);
   const links = [];
   const seen = new Set();
@@ -24,6 +43,21 @@ export function BubbleText({ text = "", sources = [] }) {
     seen.add(url);
     links.push({ title: item.title || url, url });
   }
+  for (const block of parsed.blocks) {
+    const parts = block.parts || block.items?.flat?.() || [];
+    for (const part of parts) {
+      const url = String(part?.href || "");
+      if (!/^https?:\/\//i.test(url) || seen.has(url)) continue;
+      seen.add(url);
+      links.push({ title: part.text || url, url });
+    }
+  }
+  return links;
+}
+
+export function BubbleText({ text = "", sources = [] }) {
+  const parsed = parseAnswer(text);
+  const links = collectSources(text, sources);
   return (
     <>
       {parsed.blocks.map((block, index) => {
@@ -62,21 +96,7 @@ export function BubbleText({ text = "", sources = [] }) {
           </ol>
         );
       })}
-      {links.length ? (
-        <div className="web-sources">
-          <h3 className="bubble-title">来源</h3>
-          <ul className="space-y-1">
-            {links.map((item) => (
-              <li key={item.url}>
-                <a href={item.url} target="_blank" rel="noopener" className="font-bold text-grass-deep underline">
-                  {item.title}
-                </a>
-                <span className="block break-all text-xs text-[#5d746c]">{item.url}</span>
-              </li>
-            ))}
-          </ul>
-        </div>
-      ) : null}
+      <SourceList sources={links} />
     </>
   );
 }

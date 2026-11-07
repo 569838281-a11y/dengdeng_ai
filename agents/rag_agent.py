@@ -12,49 +12,8 @@ logger = logging.getLogger(__name__)
 MAX_ROUNDS = 5
 _HOT = re.compile(r"热门|环境|版本强势|主流")
 _FOCUS = re.compile(r"以\s*(普通|草|火|水|光|地|冰|龙|电|毒|虫|武|翼|萌|幽|恶|机械|幻)\s*系为主")
-_TARGET = re.compile(r"(?:针对|克制)\s*([^\s，。,、]{1,12})")
+_TARGET = re.compile(r"(?:针对|克制|(?<!不)限制)\s*([^\s，。,、]{1,12})")
 _MATCHUP = re.compile(r"对战|谁会赢|谁赢|打得过")
-
-
-def is_direct_order(question: str) -> bool:
-    """仓库增减、查看、删除和句中已经写明的改动，仍走原来的工具。"""
-    from agents.battle_orders import (
-        _asks_saved_lineup,
-        _changes_from_text,
-        _is_new_lineup,
-        _team_id_from_text,
-        _wants_delete_team,
-        _wants_patch,
-        _wants_release,
-        wants_lineup,
-    )
-
-    text = str(question or "")
-    if wants_lineup(text):
-        return False
-    if _team_id_from_text(text) and _TARGET.search(text) and not _changes_from_text(text):
-        return False
-    if _wants_release(text) or _wants_delete_team(text):
-        return True
-    if _wants_patch(text) and _changes_from_text(text):
-        return True
-    if "仓库" in text:
-        return True
-    if _asks_saved_lineup(text) and not _is_new_lineup(text):
-        return True
-    return False
-
-
-def needs_team_rag(question: str) -> bool:
-    """要排六人，或要把某一套改成针对某只，才进配队检索环。"""
-    from agents.battle_orders import _changes_from_text, _team_id_from_text, wants_lineup
-
-    text = str(question or "")
-    if wants_lineup(text):
-        return True
-    if _team_id_from_text(text) and _TARGET.search(text) and not _changes_from_text(text):
-        return True
-    return False
 
 
 def _focus_type(question: str) -> str:
@@ -98,6 +57,25 @@ def _too_uniform(mons: list, chart: dict) -> bool:
     return False
 
 
+def _types_from_label(label: str) -> list:
+    """「地武队」这种由属性名拼成的叫法，直接读出属性。"""
+    from pokemon_kb import _TYPE_ORDER
+
+    stem = re.sub(r"(队|阵容|搭配)$", "", label or "")
+    if not stem:
+        return []
+    kinds = sorted(_TYPE_ORDER, key=len, reverse=True)
+    found = []
+    rest = stem
+    while rest:
+        matched = next((kind for kind in kinds if rest.startswith(kind)), "")
+        if not matched:
+            return []
+        found.append(matched)
+        rest = rest[len(matched):]
+    return found
+
+
 def _resolve_target(label: str, catalog: dict) -> dict:
     from pokemon_kb import _TYPE_ORDER, _mentioned_names, load_pokemon
 
@@ -105,6 +83,9 @@ def _resolve_target(label: str, catalog: dict) -> dict:
         return {"types": [], "missing": ""}
     if label in _TYPE_ORDER:
         return {"types": [label], "missing": ""}
+    typed = _types_from_label(label)
+    if typed:
+        return {"types": typed, "missing": "", "name": ""}
     found = _mentioned_names(label, load_pokemon())
     if found and found[0] in catalog:
         mon = catalog[found[0]]
@@ -124,7 +105,7 @@ def _opponent_names(question: str) -> list:
     return found
 
 
-def _select_six(question: str, pool: list, catalog: dict, chart: dict, target_types: list, focus: str, target_name: str = "", session_id: str = "") -> dict:
+def _select_six(question: str, pool: list, catalog: dict, chart: dict, target_types: list, focus: str, target_name: str = "", session_id: str = "", cut: str = "") -> dict:
     from pokemon_kb import _mentioned_names, _name_stem, can_learn_tilt, load_pokemon
 
     opponents = set(_opponent_names(question))
@@ -213,7 +194,7 @@ def _select_six(question: str, pool: list, catalog: dict, chart: dict, target_ty
         rest = [mon for mon in mons if _name_stem(mon["name"]) not in used]
         if not rest:
             break
-        rest.sort(key=lambda mon: score(mon, names), reverse=True)
+        rest.sort(key=lambda mon: score(mon, names), reverse=(cut != "alternate"))
         if not add(rest[0]["name"]):
             break
 
@@ -279,6 +260,60 @@ def _pool(question: str) -> list:
     if _roster_unbounded(question):
         return list(_catalog())
     return [name for name, count in _stock().items() if count > 0]
+
+
+def preview_lineup(question: str, session_id: str = "", target_types=None, cut: str = "") -> dict:
+    """选一次六人。不保存出场，也不对玩家说话。限制对象还不在名录里时不选。"""
+    from agents.battle_orders import _catalog
+    from agents.chat_notebook import catalog_for_session, preference_clause
+    from pokemon_kb import load_rules, type_chart
+
+    text = str(question or "").strip()
+    clause = preference_clause(session_id)
+    catalog = catalog_for_session(_catalog(), session_id)
+    guided = text if not clause else text.rstrip("。") + "。" + clause
+    label = _target_label(text)
+    if target_types:
+        target = {"types": list(target_types), "missing": "", "name": ""}
+    elif label:
+        target = _resolve_target(label, catalog)
+    else:
+        target = {"types": [], "missing": ""}
+    missing = target.get("missing") or ""
+    if missing and not target_types:
+        return {"ok": False, "names": [], "answer": "", "hard": ["identity"], "missing": missing, "hot": bool(_HOT.search(text))}
+    if not load_rules():
+        return {"ok": False, "names": [], "answer": "灯灯没有翻到相关信息。", "hard": ["rules"], "missing": "", "hot": False}
+    pool = _pool(text)
+    chart = type_chart()
+    selection = _select_six(
+        guided,
+        pool,
+        catalog,
+        chart,
+        target.get("types") or [],
+        _focus_type(text),
+        target.get("name") or "",
+        session_id,
+        cut,
+    )
+    names = list(selection.get("names") or [])
+    hard = list(selection.get("hard") or [])
+    swap = _favorite_swap(session_id, names, catalog, text)
+    if cut != "alternate" and swap and swap["name"] in pool and not hard:
+        names = [swap["name"] if name == swap["drop"] else name for name in names]
+    if hard or len(names) != 6:
+        if "core" in hard:
+            missing_core = "、".join(selection.get("missing") or []) or "点名的伙伴"
+            answer = f"灯灯按现有伙伴排不出六只。要是仓库里有{missing_core}，就能以它为核心。"
+        elif "tilt" in hard:
+            answer = "灯灯按现有伙伴排不出六只。要是再有一只能让队伍倾斜的伙伴，就能排完整。"
+        elif "uniform" in hard:
+            answer = "灯灯按现有伙伴排不出六只。要是属性再散开一些，才不会被一只完全克制。"
+        else:
+            answer = "仓库里的伙伴还凑不齐六只，灯灯先不记新的一套出场。"
+        return {"ok": False, "names": names, "answer": answer, "hard": hard or ["short"], "missing": missing, "hot": bool(_HOT.search(text))}
+    return {"ok": True, "names": names, "answer": "", "hard": [], "missing": "", "hot": bool(_HOT.search(text))}
 
 
 def _gap_sentence(question: str, evidence: dict) -> str:
@@ -439,6 +474,9 @@ def run_team_rag(question: str, progress=None, session_id: str = "", cancel=None
     from agents.thoughts import note_thought
 
     clause = preference_clause(session_id)
+    from agents.chat_notebook import catalog_for_session
+
+    session_catalog = catalog_for_session(_catalog(), session_id)
     guided = text if not clause else text.rstrip("。") + "。" + clause
     if clause:
         note_thought("灯灯按这段对话里的规矩来排")
@@ -477,7 +515,7 @@ def run_team_rag(question: str, progress=None, session_id: str = "", cancel=None
 
             read_rules("出场规则")
         if evidence.get("target_label") and "target" not in evidence:
-            evidence["target"] = _resolve_target(evidence["target_label"], _catalog())
+            evidence["target"] = _resolve_target(evidence["target_label"], session_catalog)
             from agents.thoughts import note_read as read_target
 
             target_name = (evidence["target"].get("name") or evidence["target"].get("missing") or "")
@@ -490,7 +528,7 @@ def run_team_rag(question: str, progress=None, session_id: str = "", cancel=None
             evidence["selection"] = _select_six(
                 guided,
                 evidence.get("pool") or [],
-                _catalog(),
+                session_catalog,
                 evidence["chart"],
                 target_types,
                 evidence.get("focus") or "",
@@ -529,7 +567,7 @@ def run_team_rag(question: str, progress=None, session_id: str = "", cancel=None
         seated = _companions(
             guest,
             evidence.get("pool") or [],
-            _catalog(),
+            session_catalog,
             evidence.get("chart") or {},
             (evidence.get("target") or {}).get("types") or [],
             guided,
@@ -572,13 +610,13 @@ def run_team_rag(question: str, progress=None, session_id: str = "", cancel=None
         return _pack(spoken, "", False, evidence)
     if cancel and cancel():
         return _pack("", "", False, evidence)
-    swap = _favorite_swap(session_id, names, _catalog(), text)
+    swap = _favorite_swap(session_id, names, session_catalog, text)
     if swap and swap["name"] in (evidence.get("pool") or []):
         names = [swap["name"] if name == swap["drop"] else name for name in names]
         from agents.thoughts import note_thought as remember_use
 
         remember_use(f"灯灯记得你用过{swap['name']}")
-    elif swap and swap["name"] not in _catalog():
+    elif swap and swap["name"] not in session_catalog:
         from knowledge_search import _guest_ready
         from agents.chat_notebook import recall_pages
 
@@ -599,7 +637,7 @@ def run_team_rag(question: str, progress=None, session_id: str = "", cancel=None
             tell("done", "配队完成")
             return _pack(spoken, roster if ok else "", ok, evidence)
     replace_id = _team_id_from_text(text)
-    sentence, ok, roster = _save_team(guided, names=names, replace_id=replace_id)
+    sentence, ok, roster = _save_team(guided, names=names, replace_id=replace_id, session_id=session_id)
     extra = _gap_sentence(text, evidence) if verdict == "partial" or evidence.get("hot") else ""
     if extra and ok:
         sentence = sentence.rstrip() + extra

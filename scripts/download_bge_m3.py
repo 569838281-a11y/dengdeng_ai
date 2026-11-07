@@ -22,6 +22,7 @@ ALLOW_PATTERNS = [
     "special_tokens_map.json",
     "sentencepiece.bpe.model",
     "sentence_bert_config.json",
+    "config_sentence_transformers.json",
     "modules.json",
     "colbert_linear.pt",
     "sparse_linear.pt",
@@ -30,6 +31,8 @@ ALLOW_PATTERNS = [
 
 
 def main() -> int:
+    # 大文件走普通 HTTP。镜像上的 xet 通道会停在权重文件，不开始写入。
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
     from huggingface_hub import snapshot_download
 
     print(f"下载 {REPO_ID} -> {TARGET_DIR}")

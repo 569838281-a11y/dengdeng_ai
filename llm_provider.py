@@ -281,6 +281,15 @@ def get_team_invoke(timeout: int = None):
     return invoke
 
 
+def get_team_chat():
+    """给边想边说用的对话模型。不套成文那层整段超时。"""
+    if LLM_PROVIDER == "deepseek":
+        provider: BaseLLMProvider = DeepSeekProvider(timeout=8, max_retries=1)
+    else:
+        provider = ZhipuProvider(timeout=8, max_retries=1)
+    return provider._chat
+
+
 def get_llm_provider() -> BaseLLMProvider:
     """返回全局 LLM 供应商（主备降级链），惰性构建并缓存"""
     global _llm_provider

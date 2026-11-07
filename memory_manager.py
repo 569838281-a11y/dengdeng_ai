@@ -264,29 +264,24 @@ class MemoryManager:
         long_term_memories = self.retrieve_relevant_memories(
             user_id, current_question
         )
-        
-        context_parts = []
-        
-        if long_term_memories:
-            context_parts.append("### 历史记忆（长期）")
-            for i, mem in enumerate(long_term_memories, 1):
-                context_parts.append(
-                    f"{i}. {mem['summary']} "
-                    f"(类型: {mem['memory_type']}, 重要性: {mem['importance_score']:.1f})"
-                )
-                if mem.get("key_entities"):
-                    context_parts.append(f"   关键词: {', '.join(mem['key_entities'])}")
-        
-        if short_term_history:
-            context_parts.append("\n### 当前会话（短期）")
-            for msg in short_term_history[-4:]:
-                role = "用户" if msg.get("role") == "user" else "助手"
-                content = msg.get("content", "")
-                if len(content) > 100:
-                    content = content[:100] + "..."
-                context_parts.append(f"{role}: {content}")
-        
-        return "\n".join(context_parts) if context_parts else ""
+        from agents.kv_blocks import pack_memory_text
+        from agents.preference_pages import pages_for
+
+        memories = list(long_term_memories)
+        for page in pages_for(user_id):
+            memories.append({
+                "id": page["id"],
+                "summary": page["text"],
+                "key_entities": [],
+                "importance_score": 0.6,
+            })
+        text, stats = pack_memory_text(
+            current_question,
+            memories,
+            short_term_history or [],
+        )
+        self.last_kv_stats = stats
+        return text
     
     def cleanup_old_memories(self, days: int = 30, min_importance: float = 0.3):
         """清理旧的低重要性记忆

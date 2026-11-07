@@ -1,0 +1,610 @@
+智能配队 Agent：KV Cache 与三条能力线优化计划
+（每处设计均标注采自论文 / 竞赛或评测基准；未发表协议与工业框架单独标明）
+
+仓库：C:\Users\ADMIN\Desktop\Policy-qa
+日期：2026-10-11
+约束：注意力与 KV 压缩只决定「这一轮模型读哪些旧上下文」。
+      六人名单、技能、血脉、仓库数量仍由 pokemon_kb / battle_orders 程序决定，不交给 RL 或 KV 淘汰。
+      云端 API（智谱 / DeepSeek）拿不到 GPU 上的 KV，那边只压缩送进模型的文本块。
+      真 KV 压缩只接本地 lora_replier 的 HuggingFace generate。
+
+
+================================================================
+0. 现成锚点（本仓库，不是论文）
+================================================================
+
+- 记忆拼接：memory_manager.build_memory_context（长期记忆 + 最近约 4 轮）
+- 检索员改写：agents/pipeline.py standalone_query
+- 配队检索环：agents/rag_agent.py（最多 5 圈）
+- 知识查找：knowledge_search.py
+- 工具：agents/battle_orders.py + MCP（mcp_host / mcp_docs_server）
+- 成文：dengdeng_reply.py（LoRA → teacher → fallback）
+- 轨迹：data/agent_traces
+
+
+================================================================
+1. 总结构：块级 KV + 三条能力线
+================================================================
+
+一块 = 一轮对话、一次工具 Observation、一条检索证据、一条长期记忆。
+
+设计：用当前问句当 observation，必留最近 1–2 轮，其余按「问句对块」的注意力（或 QK 代理）留 Top-K，再进入检索 / 工具 / 成文。
+采自：SnapKV（Li et al., NeurIPS 2024）的「生成前用 observation window 给 prompt KV 打分并成簇保留」；
+      与 H2O（Zhang et al., NeurIPS 2023）的「recent + heavy hitter 必须同时留」合并到块级，而不是 token 级 GPU cache。
+评测习惯采自：LongBench（Bai et al., ACL 2024 Findings）与 Needle-in-a-Haystack（Kamradt, 2023，压力测试协议，非正式会议论文）。
+
+
+================================================================
+2. 工作流 0：KV / 注意力记忆层（先做）
+================================================================
+
+2.1 把历史切成带 id 的块，不再「截最近 N 条全文」
+    改：memory_manager、会话历史送进模型前的打包。
+    采自：MemGPT（Packer et al., arXiv 2310.08560 / 后续修订）的分页记忆与 OS 式换入换出；
+          Generative Agents（Park et al., UIST 2023）的记忆流切条、检索后再读。
+    本仓库落地：块来源标成 对话 / 检索 / 工具 / 长期记忆，对应你们已有的 sqlite 记忆与 agent_traces。
+
+2.2 用当前问句给旧块打分
+    本地 Qwen 最后一层：「问句 token → 块内 token」注意力均值；拿不到内部注意力时，同一套编码器做 Q·K 点积。
+    采自：SnapKV（NeurIPS 2024）observation window 投票；
+          Quest（Tang et al., ICML 2024）「token 是否关键取决于当前 Query」——块级采用，不做 CUDA page min/max kernel。
+    回退打分（无注意力时）采自：RAG 双编码器检索（Lewis et al., NeurIPS 2020）与 DPR（Karpukhin et al., EMNLP 2020）。
+
+2.3 固定 token 预算：window + heavy hitter，超了丢分最低的旧块
+    采自：H2O（NeurIPS 2023）驱逐策略（保留最近 + 累计注意力高的 token，形式化为动态子模）；
+          StreamingLLM（Xiao et al., ICLR 2024）必须保留开头 attention sink 的经验——对应本系统把「当前仓库摘要 / 第 N 套权威状态」当作 sink，禁止被压缩丢掉。
+    不采用：单纯 FIFO 滑窗（这是 StreamingLLM 对比基线，也是本仓库现状「最近 4 轮」）。
+
+2.4 真 KV 压缩只接本地 LoRA 生成
+    改：lora_replier 的 HuggingFace generate；可参考 SnapKV 官方 monkeypatch（Llama/Mistral），Qwen2.5-1.5B 需改对应 attention 模块。
+    采自：SnapKV 官方实现 https://github.com/FasterDecoding/SnapKV
+    明确不接：云端 teacher。那边只吃 2.3 压过的文本块（思想仍来自 SnapKV 的 prefill 压缩，作用点改为 API 的 prompt 长度）。
+
+2.5 隔离：写盘路径不经压缩
+    删套、放生、换招仍走 battle_orders。
+    采自：Toolformer（Schick et al., NeurIPS 2023）把「该不该调工具」与「语言生成」分开；
+          本仓库已有规则纠偏 _correct_order，保持「工具正确性优先于上下文压缩」。
+
+
+验收（工作流 0）
+    - 压缩比、关键实体命中率（本轮点名的精灵/技能是否仍在 Keep 里）
+    - 成文延迟、事实保持率（沿用已有人设 vs 事实 eval）
+    指标形式采自：SnapKV 文中的 memory efficiency / decoding speed 与 LongBench；
+                  关键实体命中是把 Needle-in-a-Haystack 从「藏一句」改成「藏一个精灵全名」。
+
+
+================================================================
+3. 工作流 1：Agentic RL（能力增长主引擎）
+================================================================
+
+环境定义：一条用户原句触发的多步 job（检索圈、工具、校验 issues、用户下一句改或骂）。
+    采自：ReAct（Yao et al., ICLR 2023）Thought–Action–Observation；
+          WebShop（Yao et al., NeurIPS 2022）把电商多步决策写成 RL 环境——本仓库用仓库 SKU + 配队履约代替商品下单。
+
+3.1 稀疏终局奖励
+    组队是否写入 teams.csv、放生 count 是否减对、用户是否立刻再改同一套。
+    采自：InstructGPT / RLHF（Ouyang et al., NeurIPS 2022）结果级人类偏好；
+          Search-R1（Jin et al., arXiv 2503.09516）刻意只用 outcome reward、对检索 token 做 mask 以稳定训练。
+    竞赛/评测对照：WebShop 任务成功率；GAIA（Mialon et al., 2023）长程助手终局对错。
+
+3.2 过程奖励（先规则，后学一个打分器）
+    现成信号：validate_team_answer 的 issues 数；rag_agent 第几圈 enough；工具选错（查看走成 save_team）；
+              灯灯禁词与 team_keeps_roster；SnapKV 误丢关键块。
+    采自：Let's Verify Step by Step（Lightman et al., ICLR 2024）过程监督 PRM，PRM800K；
+          Uesato et al. 过程 vs 结果监督（数学推理，DeepMind, 2022）。
+    规则版过程奖励（未训练 PRM 前）采自：程序校验当 dense shaping，对应本仓库 checker / validate_team_answer，
+          不是把 MATH 的逐步打分原样搬来。
+    注意：Search-R1 与后续实证（Jin et al., arXiv 2505.15117）发现「中间检索奖励往往没用、格式奖励有用」。
+          因此过程奖励优先打「工具格式/路由对错、关键块是否保留」，不要给「又检索了一轮」加分。
+
+3.3 训练顺序（样本效率）
+    (1) 行为克隆：只模仿「工具选对 + 检索该停」的轨迹
+        采自：STaR（Zelikman et al., NeurIPS 2022）从成功推理轨迹自举；
+              ReST（Gulcehre et al., 2023）迭代生成再离线学习。
+    (2) 过程奖励模型：学 issues / 停圈，不先上 PPO
+        采自：Lightman et al. ICLR 2024；先 RM 后策略。
+    (3) 轻量 RL 只动检索规划、查询改写、记忆打分头
+        采自：GRPO（Shao et al., DeepSeekMath, 2024）组相对策略，省 value 网络，适合 8GB 级；
+              PPO（Schulman et al., 2017）作为对照算法，Search-R1 同时报了 PPO 与 GRPO。
+        明确不 RL：propose_team_line / complete_team_answer。
+    (4) 自我博弈：同一仓库两种检索预算互打，校验 issues + 用户补丁当裁判
+        采自：AlphaZero（Silver et al., Science 2018）自对弈；
+              SPIN（Chen et al., ICLR 2024）用自身上一轮当对手做偏好；
+              Constitutional AI（Bai et al., 2022）原则当裁判——此处裁判换成规则 issues，避免模型互吹。
+    (5) 稳定：奖励归一、KL 拴 teacher、失败回退规则
+        采自：InstructGPT 的 PPO-KL；DPO（Rafailov et al., NeurIPS 2023）可作无需 PPO 的备选；
+              本仓库 dengdeng_reply 的 LoRA→teacher→fallback 已是「策略崩溃则规则回退」。
+
+3.4 角色可分、训练可分（不是把单模型叫成多智能体）
+    检索员 / 工具路由 / 成文 / 程序校验员。校验员保持程序，不训练会放水的 critic。
+    采自：CAMEL（Li et al., 2023）角色分工；AutoGen（Wu et al., 2023/COLM 相关）对话式多 agent；
+          MAPPO（Yu et al., 2022）中心化价值、分布式策略——仅作「分角色训练」参考，不搬 MARL 公式。
+    框架落点：LangGraph 显式状态图（LangChain 工业框架，非论文）；
+              OpenAI Swarm 的轻量交接仅作接口对照；工具协议用已有 MCP（Anthropic, 2024，协议文档非 CCF 论文）。
+
+3.5 轨迹即训练数据
+    收：问句、工具 JSON、是否被 _correct_order 改掉、Keep 的块 id、issues、用户是否反悔。
+    采自：Let's Verify 的逐步标注思路 + ToolBench（Qin et al., ICLR 2024）工具调用轨迹；
+          Berkeley Function Calling Leaderboard（BFCL）的「解析对、执行对」拆开计分。
+
+
+================================================================
+4. 工作流 2：Search Agent / Deep Research
+================================================================
+
+现状：knowledge_search 结构化 + 向量；rag_agent 最多 5 圈补洞。
+缺口：改写弱、冲突弱、长程后上下文被截断（靠工作流 0 补）。
+
+4.1 检索规划：把复合问拆成有序子查询
+    采自：ReAct（ICLR 2023）；IRCoT（Trivedi et al., ACL 2023）检索与思维链交织；
+          Self-RAG（Asai et al., ICLR 2024）用反思 token 决定何时检索、是否采用。
+    竞赛/评测：HotpotQA（Yang et al., EMNLP 2018）多跳；MuSiQue（Trivedi et al., TACL 2022）；
+              GAIA 的「多步查资料再写报告」。
+
+4.2 查询改写（扩写 standalone_query，保留精灵全名与板块号）
+    采自：Query2Doc（Wang et al., SIGIR 2023）用生成伪文档扩查询；
+          HyDE（Gao et al., 2022/ACL 相关）假设文档嵌入；
+          RQ-RAG（Chan et al., 2024）学会改写、分解、消歧。
+    改写结果当作 SnapKV 的 observation window（再次采自 SnapKV）。
+
+4.3 证据分页存储，不拼成一篇长 prompt
+    规则表、JSON、网页、仓库四源分块进 KV 页。
+    采自：RAG（Lewis et al., NeurIPS 2020）检索再生成；
+          FLARE（Jiang et al., EMNLP 2023）按需主动再检索；
+          Quest（ICML 2024）页级选读。
+
+4.4 多源冲突：本地 rules.md / 精灵 JSON 优先，网页降权并保留双方
+    采自：知识冲突综述与实验设定（Xu et al., "Knowledge Conflicts for LLMs" 等 2024 线路）；
+          Self-RAG 的 critique（是否支持、是否相关）而不是静默覆盖。
+    竞赛习惯：HotpotQA 的 supporting facts；ALCE（Gao et al., EMNLP 2023）引用是否支撑断言。
+
+4.5 可信溯源：回答对齐块 id / 板块，不把 MCP 文件名念给用户
+    采自：WebGPT（Nakano et al., 2021）带引用的长答；
+          ALCE（EMNLP 2023）归因评测；
+          本仓库灯灯禁词是产品约束，不是论文方法。
+
+4.6 长程 Deep Research 的 RL
+    数十步停在「证据够写分析」，不是用满 5 圈。
+    每圈奖励 = 新信息增量 − 重复检索；KV 命中率进辅助项。
+    采自：Search-R1（arXiv 2503.09516）多轮 search 交织 + outcome reward + retrieved-token mask；
+          Search-o1（Li et al., 2025 线路）推理期 Agentic RAG；
+          DeepSeek-R1（Guo et al., 2025）长程推理 RL 的训练范式（本仓库只迁「停得住、格式对」，不迁满血长 CoT）。
+    产品对照（非正式论文）：OpenAI Deep Research / Gemini Deep Research 的「长程检索-写作」任务形态。
+    评测集建议：自建 30 条追问（为什么进化之力 / 为何不是首领血脉 / 和上一套差在哪），
+                计分方式对齐 GAIA + ALCE（终局有用 + 能指到规则块）。
+
+开放域网页只补本地没有的条目。配队以仓库 + rules.md 为准。
+    采自：FreshLLMs / 实时检索补过时知识的设定，但领域权威源优先级来自本业务，不是网页。
+
+
+================================================================
+5. 工作流 3：生活服务助理（洛克王国当业务沙盒）
+================================================================
+
+对照餐饮 / 到店 / 履约：SKU=精灵名录与仓库 count；履约=teams.csv / warehouse.csv 写盘。
+
+5.1 多工具长链
+    list / change / save / patch / delete + MCP 读写。
+    采自：Toolformer（NeurIPS 2023）；Gorilla（Patil et al., 2023）API 调用；
+          ToolLLM / ToolBench（Qin et al., ICLR 2024）。
+    评测：BFCL；τ-bench（Yao et al., 2024，零售/航空工具+策略，Sierra/斯坦福）——
+          把「用户政策 + 多工具」改写成「配队规则 + 仓库工具」。
+    协议：MCP（Anthropic, 2024）。本仓库已实现 csv/docx/pdf，不换协议。
+
+5.2 澄清后再执行，不猜 delta
+    放生未写数量、换人仓库没有、一句两处只解析出一处 → 问一句。
+    采自：任务型对话澄清（MultiWOZ，Budzianowski et al., EMNLP 2018；
+          Schema-Guided Dialogue，Rastogi et al., AAAI 2020）。
+    不采：让 RL 学习「猜用户没说的数量」（τ-bench 里乱改订单会直接失败）。
+
+5.3 主动服务
+    仓库 <6 不假组队；有首领血脉还说进化之力不妥当记负例。
+    采自：Generative Agents 的主动计划；Reflexion（Shinn et al., NeurIPS 2023）事后语言反馈——
+          此处反馈来自规则 issues 与用户补丁，不是模型自己写反思长文。
+
+5.4 个性化记忆与偏好
+    常用系、禁用蓄力、常改的第 N 套 → 长期记忆页。
+    采自：MemoryBank（Zhong et al., 2023）；MemGPT 分页；
+          HippoRAG（Gutiérrez et al., NeurIPS 2024）用知识图式联想检索长期记忆。
+    与 KV 的关系：偏好进长期页，当前履约状态进必留 window（H2O recent + StreamingLLM sink）。
+
+5.5 跨会话状态
+    session_id + sqlite + teams.csv / warehouse.csv 为权威状态。
+    采自：MemGPT 的主上下文 vs 外部存储；任务型对话的 dialogue state tracking（SGD / MultiWOZ）。
+    工业对照：LangGraph checkpointer（框架，非论文）。
+
+5.6 面向真实用户反馈的 RL 闭环
+    下一句「删掉 / 换招 / 放生」= 过程负奖励；不再改 = 弱正奖励。
+    采自：RLHF（Ouyang et al., NeurIPS 2022）人类反馈；
+          WebShop 里「买错商品再改」的轨迹；
+          τ-bench 用后续用户句检验策略是否被遵守。
+
+
+================================================================
+6. 数据、训练栈、框架（对应任职条目）
+================================================================
+
+6.1 高质量业务轨迹
+    从 traces 抽（问句, 工具 JSON, 纠偏前后, issues, 反悔）。
+    人工只标一小份「关键块是否该留」，校准注意力打分。
+    采自：PRM800K 的逐步标注思想；ToolBench 轨迹；BFCL 拆分计分。
+    竞赛数据不直接当训练：HotpotQA / GAIA 只作检索能力外测，领域语料仍是洛克规则与仓库日志。
+
+6.2 框架
+    PyTorch + HuggingFace Transformers（SnapKV、Qwen LoRA、打分头）。
+    采自：各论文官方实现惯例（H2O、SnapKV、Search-R1 均基于 HF 或可复现代码）。
+    Agent 编排：LangGraph 画「路由 → 检索环 → 工具 → 记忆压缩 → 成文」；
+    多 agent 交接对照 Swarm；工具生态 MCP（已有）。
+
+6.3 算法基础落点
+    LLM 注意力与 KV：H2O / SnapKV / Quest / StreamingLLM
+    NLP 检索改写：RAG / IRCoT / Query2Doc / Self-RAG
+    RL：PPO、GRPO、PRM、outcome reward（Search-R1）
+    规划与工具：ReAct、Toolformer、τ-bench 任务形态
+
+
+================================================================
+7. 十二周节奏
+================================================================
+
+周 1–2  块级记忆 + SnapKV 类压缩上线
+        对照「最近 N 轮」：延迟、命中、事实保持
+        论文：SnapKV、H2O、StreamingLLM；评测：LongBench 指标习惯、Needle 改写
+
+周 3–4  检索规划 / 改写 / 证据页 / 冲突与溯源
+        Deep Research 追问集 30 条
+        论文：IRCoT、Self-RAG、Query2Doc、ALCE；评测：HotpotQA 形态、GAIA 形态
+
+周 5–6  澄清 + 跨会话偏好页；工具长链与用户补丁进 trace
+        论文：MultiWOZ/SGD、MemGPT、ToolBench；评测：τ-bench / BFCL 计分法
+
+周 7–8  过程奖励表 + 行为克隆；校验员保持程序
+        论文：Let's Verify Step by Step、STaR、ReST
+
+周 9–10 对规划与打分头做小规模 RL（GRPO 优先）
+        论文：DeepSeekMath GRPO、Search-R1、InstructGPT KL
+        看同样 500 条轨迹下 issues 是否下降
+
+周 11–12 消融：无 KV 压缩 / 无过程奖励 / 无冲突消解
+         写法对齐 SnapKV / Search-R1 的消融表，供作品集用数字而不是形容词
+
+
+================================================================
+8. 风险与明确不采用的做法
+================================================================
+
+- 云端 API 没有 GPU KV：只许报「送进 API 的块数 / token 数」，不许报虚构的 KV hit rate。
+  依据：H2O/SnapKV 的实验设置都是自托管权重。
+
+- 选六人、补技能不做 RL、不进 KV 淘汰。
+  依据：本仓库程序选队已是可复现规则；Toolformer 也把工具与生成分开。
+
+- 不给「多检索一轮」加过程分。
+  依据：Search-R1 实证（arXiv 2505.15117）中间检索奖励帮助有限。
+
+- 不把 LangGraph/Swarm 整仓重写当目标。它们是编排，不是 KV 或 RL 算法来源。
+
+- 蓄力技、首领血脉、删套、放生等规则回归每迭代必跑（本仓库产品约束）。
+
+
+================================================================
+9. 文献与评测速查（正文出现过的）
+================================================================
+
+【KV / 长上下文】
+- Zhang et al. H2O: Heavy-Hitter Oracle for Efficient Generative Inference of Large Language Models. NeurIPS 2023.
+  https://arxiv.org/abs/2306.14048
+- Li et al. SnapKV: LLM Knows What You are Looking for Before Generation. NeurIPS 2024.
+  https://arxiv.org/abs/2404.14469
+- Xiao et al. Efficient Streaming Language Models with Attention Sinks. ICLR 2024.  （StreamingLLM）
+- Tang et al. Quest: Query-Aware Sparsity for Efficient Long-Context LLM Inference. ICML 2024.
+- Bai et al. LongBench: A Bilingual, Multitask Benchmark for Long Context Understanding. ACL 2024 Findings.
+- Kamradt. Needle in a Haystack. 2023.  （评测协议）
+
+【Agent 推理与工具】
+- Yao et al. ReAct: Synergizing Reasoning and Acting in Language Models. ICLR 2023.
+- Schick et al. Toolformer: Language Models Can Teach Themselves to Use Tools. NeurIPS 2023.
+- Qin et al. ToolLLM / ToolBench. ICLR 2024.
+- Yao et al. WebShop. NeurIPS 2022.
+- Yao et al. τ-bench. 2024.
+- Berkeley Function Calling Leaderboard (BFCL).
+- Anthropic. Model Context Protocol. 2024.  （协议，非论文）
+
+【检索与 Deep Research】
+- Lewis et al. Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks. NeurIPS 2020.
+- Karpukhin et al. Dense Passage Retrieval. EMNLP 2020.
+- Trivedi et al. Interleaving Retrieval with Chain-of-Thought Reasoning (IRCoT). ACL 2023.
+- Asai et al. Self-RAG. ICLR 2024.
+- Wang et al. Query2Doc. SIGIR 2023.
+- Gao et al. HyDE. 2022.
+- Jiang et al. FLARE. Active Retrieval Augmented Generation. EMNLP 2023.
+- Nakano et al. WebGPT. 2021.
+- Gao et al. ALCE. EMNLP 2023.
+- Jin et al. Search-R1. arXiv:2503.09516, 2025.
+- Jin et al. An Empirical Study on RL for Reasoning-Search Interleaved LLM Agents. arXiv:2505.15117, 2025.
+- Yang et al. HotpotQA. EMNLP 2018.
+- Trivedi et al. MuSiQue. TACL 2022.
+- Mialon et al. GAIA. 2023.
+
+【RL / 过程奖励 / 自博弈】
+- Schulman et al. PPO. 2017.
+- Ouyang et al. Training language models to follow instructions with human feedback. NeurIPS 2022.
+- Lightman et al. Let's Verify Step by Step. ICLR 2024.
+- Shao et al. DeepSeekMath (GRPO). 2024.
+- Guo et al. DeepSeek-R1. 2025.
+- Zelikman et al. STaR. NeurIPS 2022.
+- Gulcehre et al. ReST. 2023.
+- Chen et al. SPIN. ICLR 2024.
+- Rafailov et al. DPO. NeurIPS 2023.
+- Silver et al. AlphaZero. Science 2018.
+- Bai et al. Constitutional AI. 2022.
+
+【记忆 / 对话 / 多 agent】
+- Packer et al. MemGPT. arXiv:2310.08560.
+- Park et al. Generative Agents. UIST 2023.
+- Zhong et al. MemoryBank. 2023.
+- Gutiérrez et al. HippoRAG. NeurIPS 2024.
+- Shinn et al. Reflexion. NeurIPS 2023.
+- Budzianowski et al. MultiWOZ. EMNLP 2018.
+- Rastogi et al. Towards Scalable Multi-Domain Conversational Agents (SGD). AAAI 2020.
+- Li et al. CAMEL. 2023.
+- Wu et al. AutoGen. 2023.
+- Yu et al. MAPPO. 2022.
+
+【工业框架，非论文来源】
+- LangChain LangGraph
+- OpenAI Swarm
+- HuggingFace Transformers / PEFT LoRA（本仓库已有 Qwen2.5-1.5B 成文）
+
+
+================================================================
+10. 一句话对照：JD 三条线在本计划里各吃哪篇
+================================================================
+
+Agentic RL 主引擎
+    过程奖励 ← Let's Verify Step by Step
+    检索交织 RL ← Search-R1 + GRPO
+    轨迹与稳定 ← InstructGPT PPO-KL + 本仓库 fallback
+    自博弈裁判 ← AlphaZero/SPIN 形态 + 规则 issues（不靠模型互评）
+
+Search Agent / Deep Research
+    多步规划 ← ReAct + IRCoT + Self-RAG
+    改写 ← Query2Doc / RQ-RAG
+    长上下文读证据 ← SnapKV + Quest 页选择
+    溯源 ← WebGPT / ALCE
+    外测形态 ← HotpotQA / GAIA
+
+生活服务助理
+    工具长链 ← Toolformer / ToolBench / BFCL / τ-bench
+    澄清与状态 ← MultiWOZ / SGD
+    记忆与跨会话 ← MemGPT / MemoryBank / HippoRAG
+    用户反馈闭环 ← RLHF + WebShop 式改单轨迹
+    协议与编排 ← MCP + LangGraph（框架）
+
+
+================================================================
+11. 下一截要实现的技术点
+    （调研流水线 + 搜索行为训练，落到灯灯现有入口）
+================================================================
+
+日期：2026-10-12
+来源：一份 DeepResearch 多角色流水线，外加 Qwen3-1.7B 的 GRPO 搜索后训练。
+      本节只吸收实验方法。不搬对方的题集、分数、四卡集群，也不把仓库改写成 LangGraph。
+      六人、技能、血脉、道具、胜负仍由现有程序和公式决定。
+      名录内的数字和特性只来自本地 JSON、规则表和这场对话里已经记下的修改。
+
+
+11.1 一份作业状态，贯穿一次提问
+    一次配队、检索或对战，共用一份记录：原句、拆开的子问题、证据块 id、
+    程序写出的事实句、成文稿、核对结论、退回原因。
+    对应：LangGraph 的共享状态。落点仍是现有 pipeline / knowledge_search 的一次 job，
+    不新开一套图编排。
+    状态用结构体校验字段是否齐全。
+    对应：Pydantic。缺字段的中间结果不得进入成文。
+
+
+11.2 角色按固定顺序接在现有入口上
+    计划：拆子问题，保留精灵全名。已有搜索规划继续用，不另训一个替代选人的模型。
+    检索：名录内只查本地；名录外先读图鉴，联网开关关闭则停。
+    程序成文：先按栏目或六人名单写出原文。问一栏就只写那一栏。
+    核对：独立于口吻模型，只看事实是否还在、名单是否被改。
+    找茬：专查编造的名字、同队被说成对手或伙伴、栏目外的句子、同一小段重复。
+    放行：过了才允许教师或本地 LoRA 换口气；不过就把程序原文交给用户。
+    对应：Draft / Supervisor / Researcher / Writer / Verifier / Red Team / Quality Gate。
+    核对和找茬默认用规则。教师余额不足时不另请一个模型当红队。
+
+
+11.3 联网读页限流
+    只有联网开关打开、并且本地没有可用条目时，才并行读有限几页。
+    同时在途的页数设上限。
+    对应：asyncio.gather + Semaphore 的有界并发。
+    配队路径不读公网页，也不把网页写进精灵 JSON。
+
+
+11.4 强弱分工和失败降级
+    事实、名单、仓库改动、胜负走程序。
+    口吻先用现有提示词交给教师，让她按问句换说法。微调模型先不加载，留到 11.11 之后。
+    教师没通过放行门，或超时、余额不足，再交程序原文。
+    教师超时或余额不足时，跳过成文调用，直接交程序原文，并在作业状态里记下降级原因。
+    对应：强模型负责难步骤、轻模型负责高频步骤，以及调用预算用尽后的降级。
+    本地口吻仍是现有 Qwen2.5-1.5B + LoRA（r=8）。不把默认模型换成对方的 Qwen3-1.7B。
+
+
+11.5 证据—结论对照
+    程序原文里的每一句事实，记下它来自哪一块：某只精灵的哪一栏、哪条规则、
+    哪一条结算、这场对话里的哪一处修改。
+    成文后逐句检查：名字、数字、特性必须出现在这些块里。
+    对不上的句子丢掉，整段对不上就退回程序原文。
+    对应：Evidence–Claim、Claim–Evidence Grounding。
+    同一来源只留一份。外号在进检索前收成原名，回答里说明两个叫法是同一只。
+    对应：证据去重、URL 规范化在本仓库里的做法是来源去重和叫法收束。
+    用户能看到的句子仍遵守灯灯禁词，不念出文件名、接口名和块 id。块 id 只留在轨迹里。
+
+
+11.6 放行门的三条检查
+    答在问句上：问栏目不倾倒整只，问整只不另编伙伴或对手，问谁赢只报结算。
+    来源站得住：数字和特性属于 11.5 的证据块。
+    内容不重复：同一小段出现多次就折叠；程序原文里的不同事实保留。
+    通过后允许换口气。同一问句的开头可以在现有几句灯灯开场里按问句稳定选择，
+    避免每条回答都用同一句套话。
+    对应：Quality Gate。章节级退回在本仓库收成「这一问整段退回程序原文」，
+    不做开放域长报告的分章重写。
+
+
+11.7 配对评测，先于任何训练
+    自建一组固定对话，至少覆盖：问一栏、问整只、改口后再问、外号、
+    仓库不足六只、谁赢、放生没写数量、同队之后再问某只的资料。
+    每题对两种做法打分：教师直接说，以及「程序原文 + 放行门 + 才允许换口气」。
+    四把尺子，分母都是这组题的题数：
+        格式通过：名单、栏目或工具结果能被程序原样读回。
+        证据支持：事实句能指回 11.5 的块。
+        严格正确：栏目值、六人名单或胜负与程序结果一致。
+        意思正确：允许换说法，但名字、数字、关系类型不能变。
+    另记重复句次数、教师是否降级、平均成文耗时。
+    对应：Direct LLM 对 Multi-Agent 的配对评测，以及格式成功率、证据支持率、
+    严格答案成功率、语义准确率。
+    不使用对方的 DeepResearch Bench，也不引用对方的 0.5176、13.28% 等分数。
+    40 题口吻评测继续只说明「给了事实之后会不会说话」，不代替本组。
+
+
+11.8 轨迹改成一次 rollout
+    每条任务记录：原句、子问题、工具参数、规则有没有改过工具参数、
+    留下的证据块 id、程序原文、成文稿、放行结论、五项分数、用户下一句有没有改口。
+    对应：Tool-use Rollout。记录只用于评测和以后的训练，不写进精灵 JSON。
+
+
+11.9 五项分数（规则先算，不先训打分模型）
+    答案：严格正确为 1，否则为 0。
+    格式：名单、栏目或工具结果能被程序读回为 1，否则为 0。
+    证据：事实句全部能指回来源为 1，有一句不能则为 0。
+    重复：出现重复检索、重复句子或同队关系被写错，则为 0，否则为 1。
+    工具成本：检索圈数和教师调用次数越少越高；多检索一圈不加分。
+    对应：Answer / Format / Evidence / Duplicate / Tool Cost。
+    打分器就是 11.2 的程序核对。不默认外接另一个 Judge 模型。
+    核对失败允许把程序原文再送一次口吻模型；第二次仍失败就交程序原文并停止。
+    对应：Judge Retry 与 Fail-fast。教师不可用时连第一次口吻调用都跳过。
+
+
+11.10 训练前的行为克隆数据
+    从 11.8 里只留下放行通过、且规则没有必要改写工具参数的轨迹。
+    模仿的目标是「该停的检索停了、该交的程序原文交了」。
+    对应：STaR / ReST 的成功轨迹自举，也是 GRPO 之前的冷启动。
+    选六人、补技能、结算公式不进模仿目标。
+
+
+11.11 单卡上的小组相对更新（确认 11.7 有基线之后才做）
+    同一问句让当前策略生成一小组成文或检索改写。组内按 11.9 比高低，
+    高的加强、低的削弱。不另训一个价值网络。
+    对应：GRPO 与 Group-relative Advantage。实现可沿用 TRL 的 GRPOTrainer，
+    策略仍是现有 Qwen2.5-1.5B + LoRA。
+    损失只落在成文或改写的词上。检索回来的原文、工具参数、程序原文这些位置遮住，不参与更新。
+    对应：Search-R1 对检索 token 做 mask。
+    同一题的一组分数没有高低，就丢掉这组，不更新。
+    对应：DAPO 的动态采样。整套 DAPO（更高的 clip、超长过滤、大规模集群）不在本仓库实现。
+    token 级损失只作为 GRPO 的可选项：词的损失按词计算，被遮住的位置权重为 0。
+    对应：DAPO 的 token-level policy loss 里能在单卡上用的那一部分。
+    更新范围只包括检索改写和口吻。propose_team_line、complete_team_answer、结算公式不更新。
+    KL 继续拴在教师或当前程序原文上，防止口吻更新把事实改掉。
+    对应：InstructGPT 的 PPO-KL。本仓库先做 GRPO，不并行再实现一套 PPO。
+
+
+11.12 截断和检查点
+    成文或改写超过长度被截断时，半截结果视为格式失败，不送去更新。
+    对应：Truncation-safe Parse。长度上限沿用现有成文预算，不照搬 4096 作为承诺。
+    检查点只保存 LoRA adapter 和优化器状态，便于中断后继续。
+    对应：Checkpoint Resume。单卡训练不写多 rank 同步，也不把 NCCL / DDP 列为交付。
+    开发题和正式题分开。正式题不参与 11.10 和 11.11 的更新。
+    对应：对方在 Dev 子集上对照 New Adapter 与 Base Model。
+    本仓库的对照是：未打开本地口吻的程序原文、当前 LoRA、以及更新后的 LoRA。
+    事实或名单低于程序原文，就停训并继续默认教师或模板。
+
+
+11.13 建议实现顺序
+    (1) 11.1 作业状态 + 11.5 证据句对照 + 11.6 放行门。用户先拿到稳定原文。
+    (2) 11.4 教师失败降级 + 11.3 联网限流。
+    (3) 11.7 固定题配对评测，写出四把尺子的基线。没有这张表，不开始训练。
+    (4) 11.8 轨迹 + 11.9 五项分数。
+    (5) 11.10 行为克隆数据整理。
+    (6) 11.11 与 11.12：单卡 GRPO 只动改写和口吻，并设停训条件。
+    第 7 节的周次不变。本节是那些周次里尚未写成可执行条目的部分：
+    (1)(2) 补在周 3–6 的检索与工具链上，(3)(4)(5) 对应周 7–8，(6) 对应周 9–12。
+
+
+11.14 本节明确不做
+    - 不把仓库重写成 LangGraph 或 Swarm。
+    - 不用对方的 Bench 分数、256 题、1024 条轨迹、四张 4090 作为本仓库的目标数字。
+    - 不引入 Serper。联网仍走现有开关和现有检索。
+    - 不把公网页写进 knowledge/pokemon。
+    - 不对选人、补招、伤害公式做强化学习。
+    - 不在教师不可用时改用另一个云端模型当红队或 Judge。
+
+
+【本节新增的方法出处】
+- Yu et al. DAPO: An Open-Source LLM Reinforcement Learning System at Scale. 2025.
+  https://arxiv.org/abs/2503.14476
+  本仓库只用其中的动态采样和 token 级损失形式，不复现其集群规模。
+- Shao et al. DeepSeekMath（GRPO）. 2024. 已列入第 9 节。
+- Jin et al. Search-R1. arXiv:2503.09516. 已列入第 9 节。
+- LangGraph、Pydantic、asyncio、Tavily、Serper、OpenAI Responses API、TRL GRPOTrainer
+  是框架、库或服务，不是论文结果。本仓库不把换用这些产品本身当成实验结论。
+
+
+================================================================
+12. 尚未解决的问题
+    （2026-10-12 对照使用中的不满记下。第 11 节做完，这些仍然开着）
+================================================================
+
+状态一律是：尚未解决。
+第 2 节到第 11 节能减轻其中几条，但不能当作已经做完。
+和 11.14「明确不做」撞车的条目，先留在这里，动工前要单独决定做不做。
+
+
+12.1 长对话里关键内容会散
+    尚未解决。
+    同一场对话可以按问句挑旧话，改口、外号、队友也能留下。
+    换一场新对话之后，旧记忆册里的内容不会自动进配队和检索。
+    对话一长，这一问用得上的事实仍可能被别的句子挤掉。
+
+
+12.2 检索不会拆开再查到检验通过
+    尚未解决。
+    现在更接近：能查到就写上，对不上就说没翻到，或把不匹配的内容留成缺失。
+    名录外读到的页又少又杂，答案会前后矛盾、结构乱、句子重复。
+    第 11 节的做法是对不上就退回程序原文，不是检验失败后再搜一轮，直到挑不出错。
+    多搜一轮目前不加分。名录外怎样补齐空栏目，还没有步骤。
+
+
+12.3 架构仍是一条管线
+    尚未解决。
+    一次提问还没有变成现在常见的多角色协作：各自交结果、共同改一份笔记、不过就退回。
+    第 11 节只是把现有顺序写成作业记录。11.14 写了不把仓库改成图编排。
+    若目标是看起来并能跑成那种多角色产品，本节仍算未做，不能靠做完第 11 节勾掉。
+
+
+12.4 和工具的衔接搬不走
+    尚未解决。
+    仓库、出场、文档读写还绑在灯灯这一个游戏助手上。
+    没有一套换一个业务也能接上的工具层。
+    澄清数量、按原句改仓库，只解决这个游戏里的几句命令。
+
+
+12.5 技术取舍停在单机可做的部分
+    尚未解决。
+    大规模强化学习、多卡训练、图结构的长期记忆，都还没有。
+    11.14 把对方的题集、轨迹规模和四张显卡列为不做。
+    这些若不做，和当前常见的代理训练仍有距离；若要做，须先改 11.14。
+
+
+12.6 送进模型的字数没有硬上限
+    尚未解决。
+    旧对话可以按块丢掉一部分。
+    一次教师调用、一次检索原文，仍然可能很长。
+    没有按次封顶，也没有超限就改走短原文的规则。
+
+
+12.7 模型承担的功能少
+    尚未解决。
+    六人、技能、胜负、数字仍由程序决定。模型多半只在核对通过后换说法。
+    这是第 11 节为了答案稳定而保留的做法，所以「模型做主要功能」这条不能当成第 11 节的交付。
+    若实用性要靠模型承担更多步骤，而不是靠程序把事实写死，需要另开一版范围，不能在本节里偷偷改选人和结算。
+)

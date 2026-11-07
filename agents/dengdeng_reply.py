@@ -1,70 +1,50 @@
-"""最后一跳成文：同一份 SYSTEM+USER，先本地 LoRA，再云端 teacher，再安全回退。"""
-import logging
+"""最后一跳成文。换说法交给成文员，不过再回程序原文。
 
-import config
-from langchain_core.messages import HumanMessage, SystemMessage
-
+微调先不加载，留到固定题基线之后。
+"""
 from agents.dengdeng_persona import (
-    SYSTEM,
     battle_keeps_log,
-    build_messages,
     fallback_battle,
     fallback_team,
     pick_cry,
-    soften,
     team_keeps_roster,
     wrap_facts,
 )
-from llm_provider import get_team_invoke
-
-logger = logging.getLogger(__name__)
 
 
 def _teacher(user_text: str) -> str:
-    from llm_provider import _voice_timeout
+    from agents.voice_agent import _cloud_teacher
 
-    invoke = get_team_invoke(_voice_timeout())
-    result = invoke([
-        SystemMessage(content=SYSTEM),
-        HumanMessage(content=user_text),
-    ])
-    content = getattr(result, "content", result)
-    if isinstance(content, list):
-        content = "".join(
-            part.get("text", "") if isinstance(part, dict) else str(part)
-            for part in content
-        )
-    return str(content or "").strip()
+    return _cloud_teacher(user_text)
 
 
 def _lora(user_text: str) -> str:
-    from agents.lora_replier import generate
+    from agents.voice_agent import _lora as lora
 
-    return generate(build_messages(user_text))
+    return lora(user_text)
 
 
 def _use_lora() -> bool:
-    return bool(config.USE_LORA_REPLIER)
+    from agents.voice_agent import _use_lora as use_lora
+
+    return use_lora()
 
 
 def compose(user_text: str, accept, fallback, task: str) -> dict:
-    """返回 {text, via}。via 为 lora / teacher / fallback。"""
-    if _use_lora():
-        try:
-            drafted = soften(_lora(user_text))
-            if accept(drafted):
-                return {"text": drafted, "via": "lora"}
-            logger.warning("灯灯成文回退：%s 的本地 LoRA 未通过资料校验，改走云端 teacher", task)
-        except Exception as exc:
-            logger.warning("灯灯成文回退：%s 的本地 LoRA 不可用（%s），改走云端 teacher", task, exc)
-    try:
-        drafted = soften(_teacher(user_text))
-        if accept(drafted):
-            return {"text": drafted, "via": "teacher"}
-        logger.warning("灯灯成文回退：%s 的云端 teacher 未通过资料校验，改用程序原文", task)
-    except Exception as exc:
-        logger.warning("灯灯成文回退：%s 的云端 teacher 失败（%s），改用程序原文", task, exc)
-    return {"text": fallback(), "via": "fallback"}
+    """返回 {text, via}。via 为 lora / teacher / fallback。旧话只进模型，不进回退原文。"""
+    from agents.voice_agent import speak
+
+    return speak(user_text, accept, fallback, task)
+
+
+def reply_notice(sentence: str) -> dict:
+    """询问和核对缺口直接说出这一句。不改名单，也不再加一句别的问题。"""
+    from agents.dengdeng_persona import contains_banned
+
+    body = (sentence or "").strip()
+    if not body or contains_banned(body):
+        return {"text": "灯灯这会儿没听清你要做哪一件事。再说一次。", "via": "fallback"}
+    return {"text": body, "via": "program"}
 
 
 def reply_search(user_text: str, accept, summary: str) -> dict:
@@ -74,12 +54,13 @@ def reply_search(user_text: str, accept, summary: str) -> dict:
 
 
 def reply_team(user_text: str, team_text: str) -> dict:
-    return compose(
+    result = compose(
         user_text,
         lambda text: team_keeps_roster(text, team_text),
         lambda: fallback_team(team_text),
         "配队",
     )
+    return result
 
 
 def reply_battle(user_text: str, log_lines, winner: str = "") -> dict:

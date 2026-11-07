@@ -1,4 +1,4 @@
-"""检索知识库后，由一个配队助手作答，并按标签和克制规则核对。"""
+"""监督者先写计划，再按调度词派工。选人、核对和仓库仍交给原来的程序。"""
 import json
 import logging
 import re
@@ -75,32 +75,30 @@ def _llm_text(invoke: Callable, prompt: str) -> str:
     return str(response).strip()
 
 
-def _history_text(history: List) -> str:
-    lines = []
-    for msg in (history or [])[-6:]:
-        if not isinstance(msg, dict):
-            continue
-        content = str(msg.get("content") or "").strip()
-        if not content:
-            continue
-        role = "用户" if msg.get("role") == "user" else "助手"
-        lines.append(f"{role}：{content[:200]}")
-    return "\n".join(lines)
+def _history_text(history: List, question: str = "") -> str:
+    from agents.kv_blocks import pack_history
+
+    return pack_history(question, history)
 
 
 def standalone_query(question: str, history: List, invoke: Callable) -> str:
-    """检索员把追问收成独立查询。没有历史时直接用原问题。"""
-    history_text = _history_text(history)
+    """检索员把追问收成独立查询。没有历史时直接用原问题。改写必须留下精灵全名和板块号。"""
+    from agents.kv_blocks import rewrite_keeps_anchors
+
+    history_text = _history_text(history, question)
     if not history_text:
         return question.strip()
     prompt = (
         f"{load_skill('retriever')}\n\n"
         "根据检索员技能，把对话历史和最新问题收成一个独立检索查询。\n"
-        "只输出查询词，不超过40个字，不要回答问题。\n\n"
+        "只输出查询词，不超过40个字，不要回答问题。\n"
+        "原句里的精灵全名和板块号必须原样保留。\n\n"
         f"对话历史：\n{history_text}\n\n最新问题：\n{question.strip()}"
     )
     text = _llm_text(invoke, prompt).splitlines()[0].strip().strip("\"“”")
     if not text or len(text) > 80 or text.startswith("[citation:"):
+        return question.strip()
+    if not rewrite_keeps_anchors(question, text):
         return question.strip()
     return text
 
@@ -134,7 +132,9 @@ def _parse_checker(text: str) -> Dict[str, Any]:
 
 def _notebook_team_note(question: str, session_id: str) -> str:
     """名录里没有、但这句对话已经记下的精灵，直接用记下的资料讲配队思路。"""
-    if re.search(r"以\s*.{1,16}?\s*为\s*(?:核心|主力)", question or ""):
+    from knowledge_search import _ace_label
+
+    if _ace_label(question):
         return ""
     if not re.search(r"配队|思路|怎么配|为核心|主力|出场", question or ""):
         return ""
@@ -175,17 +175,68 @@ def run_collaborative_agents(
     on_progress: Callable = None,
     session_id: str = "",
     cancel: Callable = None,
+    user_id: str = "",
+    history: List = None,
 ) -> Dict[str, Any]:
     """配队先分路。句中写明的命令走工具。要排六人或按条件改某一套，先走检索环。其余问题只查本地资料。"""
+    from agents.fact_memory import absorb_history, fact_blocks
+    from agents.kv_blocks import bind_model_context, blocks_from_traces, clear_model_context
+
+    from agents.turn_memory import carry_subject, close_turn
+
+    user_text = (question or "").strip()
+    carried = carry_subject(user_text, session_id)
+    question = carried["query"]
+    absorb_history(session_id, history)
+    from agents.work_cycle import context_blocks, prepare_turn
+
+    prepared = prepare_turn(question, history or [], user_id, anchor=carried["anchor"])
+    kv_stats = bind_model_context(
+        question,
+        history,
+        blocks_from_traces(session_id, TRACE_DIR),
+        extra=fact_blocks(session_id, question) + context_blocks(prepared),
+    )
+    kv_stats["lookup_query"] = prepared.get("query") or (question or "").strip()
+    kv_stats["cycle"] = prepared.get("steps") or []
+    kv_stats["user_text"] = user_text
+    try:
+        result = _run_collaborative_agents(
+            question,
+            on_progress,
+            session_id,
+            cancel,
+            user_id,
+            kv_stats,
+        )
+    finally:
+        clear_model_context()
+    if not (cancel and cancel()):
+        close_turn(session_id, question, result.get("intent") or "")
+    result["resolved"] = question
+    return result
+
+
+def _run_collaborative_agents(
+    question: str,
+    on_progress: Callable,
+    session_id: str,
+    cancel: Callable,
+    user_id: str,
+    kv_stats: Dict[str, Any],
+) -> Dict[str, Any]:
     def progress(step: str, message: str) -> None:
         if on_progress is not None:
             on_progress(step, message)
 
     from pokemon_kb import catalog_ready
 
-    progress("retrieve", "正在读取精灵名录和规则…")
     retrieval_query = question.strip()
+    intent = ""
+    progress("retrieve", f"小洛克在问{retrieval_query}")
+    lookup_query = (kv_stats.get("lookup_query") or retrieval_query).strip()
     snippets = []
+    job_payload = None
     team_skill = load_skill("team")
     retriever_skill = load_skill("retriever")
     if not catalog_ready():
@@ -200,40 +251,79 @@ def run_collaborative_agents(
         fallback = ""
         roster = ""
         trial = None
+        order = {}
         voice_calls = 0
     else:
-        from agents.battle_orders import run_battle_order, wants_lineup
         from agents.chat_notebook import learn
-        from agents.rag_agent import is_direct_order, needs_team_rag, run_team_rag
         from agents.thoughts import note_thought
 
-        learned = learn(session_id, retrieval_query)
-        if learned:
-            note_thought("灯灯记下你的规矩了")
+        from agents.job_ledger import waiting as ledger_waiting
+
+        held = ledger_waiting(session_id)
+        learned = []
+        if not held:
+            learned = learn(session_id, retrieval_query)
+            if user_id:
+                from agents.preference_pages import learn_preference
+
+                learned = learned + learn_preference(user_id, retrieval_query)
+            if learned:
+                note_thought("灯灯记下你的规矩了")
+        from agents.intent_judge import judge_intent
+
+        judged = judge_intent(retrieval_query)
+        intent = judged.get("intent") or ""
+        from agents.job_ledger import parked as ledger_parked
+        from agents.supervisor import _continues_lineup
+
+        earlier = ledger_parked(session_id)
+        if earlier is not None and _continues_lineup(retrieval_query, earlier):
+            intent_note = ""
+        else:
+            intent_note = intent
+        if intent_note:
+            heard = {
+                "search": "查资料",
+                "lineup": "配一套",
+                "order": "改仓库",
+                "battle": "问谁赢",
+                "remember": "补充资料",
+                "persona_story": "讲自个儿的故事",
+            }.get(intent, "办这件事")
+            from agents.react_stream import streaming
+
+            if not streaming():
+                note_thought(f"灯灯听出来这是在{heard}：{retrieval_query}")
+        if lookup_query != retrieval_query and intent != "persona_story":
+            note_thought("灯灯先把这句收成下一步")
         outside = _notebook_team_note(retrieval_query, session_id)
         stopped = cancel and cancel()
         if stopped:
             order = {"answer": "", "roster": "", "ok": False, "trial": None, "rounds": []}
         elif outside:
             order = {"answer": outside, "roster": "", "ok": True, "trial": None, "rounds": []}
-        elif is_direct_order(retrieval_query):
-            order = run_battle_order(retrieval_query)
-        elif needs_team_rag(retrieval_query) or wants_lineup(retrieval_query):
-            order = run_team_rag(retrieval_query, progress, session_id=session_id, cancel=cancel)
         else:
-            from knowledge_search import run_knowledge_search
+            from agents.supervisor import run_cycle
 
-            def report(step_id, status, detail, message):
-                progress("retrieve", message or detail or "灯灯在查资料…")
+            # 人设故事禁止用改写后的 lookup（防历史注入海豹船长等）
+            heard = retrieval_query if intent == "persona_story" else (
+                lookup_query if intent in {"search", "battle", "lineup"} else retrieval_query
+            )
+            from agents.cycle_graph import ask_dispatch
 
-            found = run_knowledge_search(retrieval_query, report, use_web=False, session_id=session_id)
-            order = {
-                "answer": found.get("answer") or "",
-                "roster": "",
-                "ok": bool(found.get("found") or found.get("trial")),
-                "trial": found.get("trial"),
-                "rounds": [],
-            }
+            cycle = run_cycle(
+                heard,
+                session_id=session_id,
+                judged=judged,
+                progress=progress,
+                cancel=cancel,
+                user_id=user_id,
+                prepared={"query": lookup_query, "hits": [], "memory": "", "steps": kv_stats.get("cycle") or []},
+                learned=learned,
+                route_ask=ask_dispatch,
+            )
+            job_payload = cycle.get("ledger")
+            order = cycle.get("order") or {}
         draft = order.get("answer") or ""
         roster = order.get("roster") or ""
         trial = order.get("trial")
@@ -246,12 +336,24 @@ def run_collaborative_agents(
         verdict = {"pass": bool(order.get("ok")), "issues": []}
         fallback = "order"
         voice_calls = 0
-        progress("done", "配队完成")
+        if order.get("pending_write"):
+            progress("done", "灯灯等你点头")
+        elif intent == "lineup":
+            progress("done", "这一套排完了")
+        elif intent == "order":
+            progress("done", "仓库这句办完了")
+        else:
+            progress("done", f"查完了：{retrieval_query}")
+
+    if job_payload is None:
+        job_payload = {}
 
     trace = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
-        "question": question,
-        "retrieval_query": retrieval_query,
+        "question": kv_stats.get("user_text") or question,
+        "resolved": question,
+        "retrieval_query": lookup_query,
+        "cycle": kv_stats.get("cycle") or [],
         "skill_name": "team",
         "skill_text": team_skill,
         "skill_steps": extract_steps(team_skill),
@@ -263,6 +365,18 @@ def run_collaborative_agents(
         "passed": bool(verdict.get("pass")),
         "llm_calls": voice_calls,
         "fallback": fallback,
+        "session_id": session_id,
+        "kv": {
+            "bypassed": bool(kv_stats.get("bypassed")),
+            "compression_ratio": kv_stats.get("compression_ratio"),
+            "entity_hit": kv_stats.get("entity_hit"),
+            "kept_ids": kv_stats.get("kept_ids") or [],
+            "dropped_ids": kv_stats.get("dropped_ids") or [],
+            "input_tokens": kv_stats.get("input_tokens"),
+            "kept_tokens": kv_stats.get("kept_tokens"),
+            "scorer": kv_stats.get("scorer") or "",
+        },
+        "rollout": job_payload or {},
     }
     TRACE_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
@@ -276,7 +390,11 @@ def run_collaborative_agents(
         "passed": bool(verdict.get("pass")),
         "llm_calls": voice_calls,
         "sources": [],
+        "web_sources": order.get("web_sources") or [],
         "rounds": rounds,
         "trace_path": str(trace_path),
+        "intent": intent,
+        "resolved": question,
+        "pending_write": order.get("pending_write") or None,
     }
 

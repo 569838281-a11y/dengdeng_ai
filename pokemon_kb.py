@@ -106,13 +106,15 @@ def _entry_names(text: str) -> List[str]:
     return names
 
 
-def _make_chunk(section: str, text: str) -> Dict:
+def _make_chunk(section: str, text: str, parent_id: str = "", chunk_type: str = "section") -> Dict:
     body = text.strip()
     return {
         "section": section,
         "text": body,
         "names": _entry_names(body),
         "source": f"{KNOWLEDGE_SOURCE} · {section}",
+        "parent_id": parent_id or f"section:{section}",
+        "chunk_type": chunk_type,
     }
 
 
@@ -136,12 +138,18 @@ def _split_entries(section: str, full: str) -> List[Dict]:
     if len(entries) < 4:
         return []
     header_text = "\n".join(header).strip()
-    chunks = []
+    parent_id = f"section:{section}"
+    names = []
+    for entry in entries:
+        first = next((line[2:].strip() for line in entry.splitlines() if line.startswith("- ")), "")
+        if first:
+            names.append(first.split("：")[0].split(":")[0][:40])
+    chunks = [_make_chunk(section, (header_text + "\n" + "\n".join(names)).strip(), parent_id, "parent")]
     for start in range(0, len(entries), _ENTRY_GROUP):
         part = entries[start:start + _ENTRY_GROUP]
         body = header_text + "\n\n" + "\n".join(part)
         label = section if len(entries) <= _ENTRY_GROUP else f"{section} #{start // _ENTRY_GROUP + 1}"
-        chunks.append(_make_chunk(label, body))
+        chunks.append(_make_chunk(label, body, parent_id, "child"))
     return chunks
 
 
@@ -1678,10 +1686,14 @@ def _effective_tilt_sentence(members: List[Dict]) -> str:
     return "有效倾斜是" + "、".join(parts) + "。"
 
 
-def complete_team_answer(answer: str, question: str = "", allowed: list = None) -> str:
+def complete_team_answer(answer: str, question: str = "", allowed: list = None, session_id: str = "") -> str:
     """按已点技能补满 4 栏，并裁定血脉和全队道具。凑不齐 6 只时原样返回。"""
     pokemon = load_pokemon()
     catalog = _by_name(pokemon)
+    if session_id:
+        from agents.chat_notebook import catalog_for_session
+
+        catalog = catalog_for_session(catalog, session_id)
     allow = {str(name) for name in allowed} if allowed is not None else None
     parsed = parse_team_config(answer, pokemon)
     members = [
@@ -1821,12 +1833,16 @@ def _member_skill_issues(
     return issues
 
 
-def validate_team_answer(answer: str, question: str) -> List[str]:
+def validate_team_answer(answer: str, question: str, session_id: str = "") -> List[str]:
     """校验六人、标签、4 技能、血脉、唯一道具、已携带技能的克制覆盖。"""
     pokemon = load_pokemon()
     if not pokemon:
         return ["知识库里没有精灵"]
     catalog = _by_name(pokemon)
+    if session_id:
+        from agents.chat_notebook import catalog_for_session
+
+        catalog = catalog_for_session(catalog, session_id)
     text = answer or ""
     issues = []
     if "队伍配置为" not in text:
